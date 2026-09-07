@@ -1,13 +1,19 @@
 """Configuration settings for SMS AI Service."""
 
+from pathlib import Path
+
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Resolve .env against the service root so settings load regardless of the
+# working directory uvicorn was started from.
+ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 
 class Settings(BaseSettings):
     """Application settings."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
     # Database
     database_url: str
@@ -61,6 +67,7 @@ class Settings(BaseSettings):
     # Cloudflare ties that cookie to the browser it was issued to, so send the
     # same User-Agent string (copy it from the same request as the cookie).
     acm_dl_user_agent: str = ""
+
     # E2E test mode — uses FakeProvider instead of real LLM APIs
     e2e_test_mode: bool = False
 
