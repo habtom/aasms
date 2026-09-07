@@ -115,8 +115,10 @@ async def resolve_pdf_url(request: PdfRetrievalRequest):
     return ResolvePdfResponse(
         found=bool(candidates),
         candidates=[
+            # ``link`` rather than ``url``: publisher candidates point at an API
+            # endpoint that only works with our credentials attached.
             PdfCandidateResponse(
-                url=c.url, provider=c.provider, license=c.license, version=c.version
+                url=c.link, provider=c.provider, license=c.license, version=c.version
             )
             for c in candidates
         ],

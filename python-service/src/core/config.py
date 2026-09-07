@@ -1,5 +1,6 @@
 """Configuration settings for SMS AI Service."""
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,6 +40,27 @@ class Settings(BaseSettings):
     pdf_retrieval_timeout_seconds: float = 30.0
     pdf_retrieval_max_mb: int = 50
 
+    # Publisher APIs, all optional. Each resolver is skipped unless its key is
+    # set, and only ever runs for records that belong to that publisher.
+    # One Elsevier key (dev.elsevier.com) covers both the Scopus Search API
+    # (title -> DOI lookup) and the ScienceDirect Article Retrieval API, which
+    # serves the PDF for open-access articles.
+    elsevier_api_key: str = Field(
+        default="", validation_alias=AliasChoices("ELSEVIER_API_KEY", "SCOPUS_API_KEY")
+    )
+    # Institutional token issued by Elsevier to a library. Needed for paywalled
+    # articles: the API ignores IP-based entitlement, so the campus network or
+    # VPN does not help without it.
+    elsevier_inst_token: str = ""
+    # IEEE Xplore metadata API key from developer.ieee.org.
+    ieee_api_key: str = ""
+    # The ACM DL has no public API. Paste the Cookie header of a logged-in
+    # dl.acm.org session to fetch articles your institution subscribes to;
+    # without it only ACM Open (free) articles can be downloaded.
+    acm_dl_cookie: str = ""
+    # Cloudflare ties that cookie to the browser it was issued to, so send the
+    # same User-Agent string (copy it from the same request as the cookie).
+    acm_dl_user_agent: str = ""
     # E2E test mode — uses FakeProvider instead of real LLM APIs
     e2e_test_mode: bool = False
 

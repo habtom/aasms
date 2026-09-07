@@ -5,14 +5,24 @@ turn that metadata into an actual PDF by asking the open scholarly APIs in
 order and downloading the first candidate that really serves a PDF:
 
 1. arXiv, when an arXiv id is already visible in the DOI or the source URL
-2. Unpaywall (requires ``oa_contact_email``)
-3. OpenAlex
-4. Semantic Scholar
-5. arXiv title search
-6. the publisher landing page (``citation_pdf_url`` meta tag)
+2. ScienceDirect, for Elsevier DOIs (requires ``elsevier_api_key``)
+3. the ACM DL, for ACM DOIs (``acm_dl_cookie`` adds subscriber access)
+4. Unpaywall (requires ``oa_contact_email``)
+5. OpenAlex
+6. Semantic Scholar
+7. arXiv title search
+8. IEEE Xplore, for IEEE DOIs (requires ``ieee_api_key``)
+9. the publisher landing page (``citation_pdf_url`` meta tag)
 
-Only openly licensed copies are fetched — nothing here attempts to bypass a
-paywall or a publisher login.
+The publisher steps are skipped unless their credential is configured, and each
+only runs for records that belong to that publisher, so the Scopus/ScienceDirect
+key is not spent on an IEEE paper. Records without a DOI first get one looked up
+through the Scopus Search API when an Elsevier key is present, which helps every
+later provider.
+
+Nothing here bypasses a paywall or a publisher login: the publisher APIs are
+called with the credentials you supply, and Elsevier serves full text only
+for its open-access articles unless an institutional token is configured.
 """
 
 from __future__ import annotations
@@ -20,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from urllib.parse import quote, urlparse
 
@@ -41,6 +51,9 @@ _LIMITER_RATES: dict[str, tuple[float, float]] = {
     "openalex": (5, 1),
     "semantic-scholar": (1, 1),
     "arxiv": (1, 3),
+    "elsevier": (2, 1),
+    "ieee": (2, 1),
+    "acm": (1, 2),
     "download": (4, 1),
 }
 _limiters: dict[tuple[str, int], AsyncLimiter] = {}
@@ -87,6 +100,39 @@ INDEX_HOSTS = frozenset(
 )
 
 
+# DOI prefixes and hosts that identify a record as belonging to a publisher we
+# have an API for. Gating on these keeps a limited key (IEEE grants 200 calls a
+# day) from being spent on papers the publisher does not carry.
+ELSEVIER_DOI_PREFIXES = ("10.1016", "10.1006", "10.1053", "10.1067", "10.1078", "10.1157")
+ELSEVIER_HOSTS = ("sciencedirect.com", "elsevier.com")
+IEEE_DOI_PREFIXES = ("10.1109", "10.23919")
+IEEE_HOSTS = ("ieee.org",)
+ACM_DOI_PREFIXES = ("10.1145",)
+ACM_HOSTS = ("acm.org",)
+
+# IEEE reports how a document may be read. These two are free for everyone;
+# Creative Commons papers come back as "CCBY - IEEE is not the copyright
+# holder ..." and are free as well, so any CC* type also counts (see
+# ieee_access_is_free).
+IEEE_FREE_ACCESS_TYPES = frozenset({"OPEN_ACCESS", "EPHEMERA"})
+# The API's ``pdf_url`` is an HTML page that embeds the PDF in an iframe; this
+# endpoint serves the file itself for the same article number.
+IEEE_PDF_URL = "https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={arnumber}"
+
+# Human-readable names for the failure message.
+PROVIDER_LABELS = {
+    "arxiv-id": "arXiv",
+    "arxiv-search": "arXiv",
+    "unpaywall": "Unpaywall",
+    "openalex": "OpenAlex",
+    "semantic-scholar": "Semantic Scholar",
+    "scopus": "Scopus",
+    "elsevier": "ScienceDirect",
+    "ieee": "IEEE Xplore",
+    "acm": "ACM DL",
+}
+
+
 @dataclass(frozen=True)
 class PdfQuery:
     """Everything we know about a source that could lead to its PDF."""
@@ -125,6 +171,17 @@ class PdfCandidate:
     #: False for the speculative probe of the source's own URL, which is not a
     #: known open-access copy and must not be reported as one.
     is_open_access: bool = True
+    #: Extra request headers, e.g. a publisher API key. Kept out of ``url`` so
+    #: credentials never end up in stored provenance or in a link we show.
+    headers: dict[str, str] = field(default_factory=dict)
+    #: The page a human should open when the download fails. Publisher API
+    #: endpoints are useless to a reader, so they carry the DOI link here.
+    public_url: str | None = None
+
+    @property
+    def link(self) -> str:
+        """The URL worth showing to a person."""
+        return self.public_url or self.url
 
     def rank(self) -> tuple[int, int]:
         """Sort key: repositories before publishers, direct PDFs before landing pages."""
@@ -162,7 +219,11 @@ class PdfRetrievalResult:
 
     def open_access_urls(self) -> list[str]:
         """Known open copies we could not download — worth offering as links."""
-        return [c.url for c in self.candidates if c.is_open_access]
+        urls: list[str] = []
+        for candidate in self.candidates:
+            if candidate.is_open_access and candidate.link not in urls:
+                urls.append(candidate.link)
+        return urls
 
 
 def is_index_host(url: str) -> bool:
@@ -176,13 +237,49 @@ def is_index_host(url: str) -> bool:
     return any(host == blocked or host.endswith(f".{blocked}") for blocked in INDEX_HOSTS)
 
 
-def describe_failure(candidates: list[PdfCandidate]) -> str:
+def ieee_access_is_free(access_type: str | None) -> tuple[bool, str | None]:
+    """Whether an IEEE ``access_type`` means anyone may read the paper.
+
+    Returns ``(is_free, license)``. Only the part before " - " matters: the
+    API pads Creative Commons types with a sentence of legal text.
+    """
+    head = str(access_type or "").split(" - ", 1)[0].strip().upper().replace(" ", "_")
+    if head in IEEE_FREE_ACCESS_TYPES:
+        return True, "IEEE Open Access"
+    if head.startswith("CC"):
+        # "CCBY" -> "CC BY", "CCBYNCND" -> "CC BYNCND"
+        return True, "CC " + head[2:] if len(head) > 2 else "CC"
+    return False, None
+
+
+def belongs_to_publisher(query: PdfQuery, doi_prefixes: tuple[str, ...], hosts: tuple[str, ...]) -> bool:
+    """True when the record is published by the given publisher.
+
+    Matched on the DOI prefix, or on the source URL for records imported without
+    a DOI. Anything else must not cost a call against a metered publisher key.
+    """
+    doi = query.clean_doi
+    if doi and doi.startswith(tuple(f"{prefix}/" for prefix in doi_prefixes)):
+        return True
+    host = urlparse((query.url or "").strip()).hostname or ""
+    return any(host == h or host.endswith(f".{h}") for h in hosts)
+
+
+def describe_failure(
+    candidates: list[PdfCandidate], providers_tried: list[str] | None = None
+) -> str:
     """Explain a miss in terms the person screening sources can act on."""
     open_access = [c for c in candidates if c.is_open_access]
     if not open_access:
-        return "No open-access copy found (checked Unpaywall, OpenAlex, Semantic Scholar, arXiv)"
+        checked = []
+        for provider in providers_tried or []:
+            label = PROVIDER_LABELS.get(provider)
+            if label and label not in checked:
+                checked.append(label)
+        listed = ", ".join(checked) or "Unpaywall, OpenAlex, Semantic Scholar, arXiv"
+        return f"No open-access copy found (checked {listed})"
 
-    hosts = sorted({urlparse(c.url).hostname or "?" for c in open_access})
+    hosts = sorted({urlparse(c.link).hostname or "?" for c in open_access})
     return (
         f"Open-access copy listed at {', '.join(hosts[:3])} but the host refused the download "
         "— upload the PDF manually"
@@ -230,6 +327,11 @@ class PdfRetrievalService:
         self.client = client
         self.contact_email = (settings.oa_contact_email or "").strip()
         self.semantic_scholar_api_key = (settings.semantic_scholar_api_key or "").strip()
+        self.elsevier_api_key = (settings.elsevier_api_key or "").strip()
+        self.elsevier_inst_token = (settings.elsevier_inst_token or "").strip()
+        self.ieee_api_key = (settings.ieee_api_key or "").strip()
+        self.acm_dl_cookie = (settings.acm_dl_cookie or "").strip()
+        self.acm_dl_user_agent = (settings.acm_dl_user_agent or "").strip()
         self.max_bytes = settings.pdf_retrieval_max_mb * 1024 * 1024
 
     # ---------------------------------------------------------------- public
@@ -241,17 +343,23 @@ class PdfRetrievalService:
         candidate, so a source resolved by the first provider costs one API call
         instead of five — which matters across a few hundred imported records.
         """
-        providers_tried: list[str] = []
+        query, providers_tried = await self._with_looked_up_doi(query)
         all_candidates: list[PdfCandidate] = []
         seen: set[str] = set()
 
         for name, resolver in self._resolvers():
-            providers_tried.append(name)
             try:
                 candidates = await resolver(query)
             except Exception as exc:  # a flaky provider must not kill the batch
                 logger.warning("PDF resolver %s failed: %s", name, exc)
+                providers_tried.append(name)
                 continue
+
+            # None means the resolver does not cover this record. It never
+            # asked, so it must not be reported as having been checked.
+            if candidates is None:
+                continue
+            providers_tried.append(name)
 
             for candidate in candidates:
                 if candidate.url in seen or is_index_host(candidate.url):
@@ -259,12 +367,14 @@ class PdfRetrievalService:
                 seen.add(candidate.url)
                 all_candidates.append(candidate)
 
-                downloaded = await self.download_pdf(candidate.url)
+                downloaded = await self.download_pdf(candidate.url, candidate.headers)
                 if downloaded:
                     return PdfRetrievalResult(
                         found=True,
                         provider=candidate.provider,
-                        source_url=downloaded.url,
+                        # Publisher API endpoints are no use to a reader, so
+                        # provenance keeps the public link where there is one.
+                        source_url=candidate.public_url or downloaded.url,
                         license=candidate.license,
                         content=downloaded.content,
                         providers_tried=providers_tried,
@@ -273,25 +383,40 @@ class PdfRetrievalService:
 
         return PdfRetrievalResult(
             found=False,
-            reason=describe_failure(all_candidates),
+            reason=describe_failure(all_candidates, providers_tried),
             providers_tried=providers_tried,
             candidates=all_candidates,
         )
 
     def _resolvers(self):
-        return (
-            ("arxiv-id", self._from_arxiv_id),
+        """The provider chain, cheapest and most likely to succeed first.
+
+        Publisher APIs are only in the chain when their key is configured; the
+        resolver itself then decides whether the record is one of theirs.
+        """
+        resolvers = [("arxiv-id", self._from_arxiv_id)]
+        if self.elsevier_api_key:
+            resolvers.append(("elsevier", self._from_elsevier))
+        # The ACM DL needs no key: since ACM Open, much of it is free, and the
+        # cookie only adds the subscriber-only remainder. It has to run before
+        # the open-access indexes: they list the very same dl.acm.org URL
+        # without credentials, and a URL is only ever downloaded once.
+        resolvers.append(("acm", self._from_acm))
+        resolvers += [
             ("unpaywall", self._from_unpaywall),
             ("openalex", self._from_openalex),
             ("semantic-scholar", self._from_semantic_scholar),
             ("arxiv-search", self._from_arxiv_search),
-            ("landing-page", self._from_landing_page),
-        )
+        ]
+        if self.ieee_api_key:
+            resolvers.append(("ieee", self._from_ieee))
+        resolvers.append(("landing-page", self._from_landing_page))
+        return tuple(resolvers)
 
     async def resolve_candidates(self, query: PdfQuery) -> tuple[list[PdfCandidate], list[str]]:
         """Ask every provider in order, collecting PDF URLs without downloading."""
         candidates: list[PdfCandidate] = []
-        providers_tried: list[str] = []
+        query, providers_tried = await self._with_looked_up_doi(query)
 
         for name, resolver in self._resolvers():
             try:
@@ -301,6 +426,8 @@ class PdfRetrievalService:
                 providers_tried.append(name)
                 continue
 
+            if found is None:
+                continue
             providers_tried.append(name)
             candidates.extend(found)
 
@@ -314,7 +441,9 @@ class PdfRetrievalService:
 
         return unique, providers_tried
 
-    async def download_pdf(self, url: str, _depth: int = 0) -> DownloadedPdf | None:
+    async def download_pdf(
+        self, url: str, headers: dict[str, str] | None = None, _depth: int = 0
+    ) -> DownloadedPdf | None:
         """Download a URL and return the bytes only if they really are a PDF.
 
         Open-access links frequently point at a landing page instead of the
@@ -326,7 +455,7 @@ class PdfRetrievalService:
                 self.client.stream(
                     "GET",
                     url,
-                    headers=self._headers(accept="application/pdf,*/*"),
+                    headers={**self._headers(accept="application/pdf,*/*"), **(headers or {})},
                     follow_redirects=True,
                     timeout=settings.pdf_retrieval_timeout_seconds,
                 ) as response,
@@ -354,7 +483,8 @@ class PdfRetrievalService:
         if _depth == 0:
             embedded = self._find_citation_pdf_url(data)
             if embedded and embedded != url:
-                return await self.download_pdf(embedded, _depth=1)
+                # Same publisher, so any credential still applies.
+                return await self.download_pdf(embedded, headers, _depth=1)
 
         logger.info("PDF download %s returned a non-PDF response", url)
         return None
@@ -605,7 +735,199 @@ class PdfRetrievalService:
                 ]
         return []
 
-    async def _from_landing_page(self, query: PdfQuery) -> list[PdfCandidate]:
+    async def _from_elsevier(self, query: PdfQuery) -> list[PdfCandidate] | None:
+        """Ask the ScienceDirect Article Retrieval API for the PDF.
+
+        Elsevier serves the full text only for its open-access articles, or for
+        subscribed ones when an institutional token is configured. For anything
+        else the API still answers 200 with a one-page preview and says so in
+        the ``X-ELS-Status`` header, which is why the candidate is not
+        advertised as an open copy.
+        """
+        doi = query.clean_doi
+        if not doi or not self.elsevier_api_key:
+            return None
+        if not belongs_to_publisher(query, ELSEVIER_DOI_PREFIXES, ELSEVIER_HOSTS):
+            return None
+
+        return [
+            PdfCandidate(
+                url=f"https://api.elsevier.com/content/article/doi/{quote(doi, safe='/')}",
+                provider="elsevier",
+                kind="pdf",
+                is_open_access=False,
+                headers={**self._elsevier_headers(), "Accept": "application/pdf"},
+                public_url=f"https://doi.org/{doi}",
+            )
+        ]
+
+    async def _from_ieee(self, query: PdfQuery) -> list[PdfCandidate] | None:
+        """Look the record up in the IEEE Xplore metadata API.
+
+        The API hands back the article number and whether the document is free
+        (``OPEN_ACCESS``/``EPHEMERA``/``CC*``) or locked; the PDF itself is
+        served by ``getPDF.jsp`` for that number. Xplore often refuses automated
+        downloads even for free papers, so an open hit that fails to download is
+        still reported as a link the user can open.
+        """
+        if not self.ieee_api_key:
+            return None
+
+        doi = query.clean_doi
+        title = query.clean_title
+        params: dict[str, str | int] = {
+            "apikey": self.ieee_api_key,
+            "format": "json",
+            "max_records": 5,
+        }
+        if doi:
+            if not belongs_to_publisher(query, IEEE_DOI_PREFIXES, IEEE_HOSTS):
+                return None
+            params["doi"] = doi
+        elif title:
+            # No DOI to gate on, so a title search is the only way to find out
+            # whether IEEE has the paper at all.
+            params["article_title"] = title
+        else:
+            return None
+
+        async with _limiter("ieee"):
+            response = await self.client.get(
+                "https://ieeexploreapi.ieee.org/api/v1/search/articles",
+                params=params,
+                headers=self._headers(),
+                timeout=settings.pdf_retrieval_timeout_seconds,
+            )
+        if response.status_code != 200:
+            logger.info("IEEE Xplore API returned %s for doi=%s", response.status_code, doi)
+            return []
+
+        candidates: list[PdfCandidate] = []
+        for article in response.json().get("articles") or []:
+            if not doi and not titles_match(title, article.get("title")):
+                continue
+
+            is_free, license = ieee_access_is_free(
+                article.get("access_type") or article.get("accessType")
+            )
+            landing = article.get("html_url") or article.get("abstract_url")
+            stamp_url = article.get("pdf_url")
+            arnumber = str(article.get("article_number") or "").strip()
+            # Prefer the endpoint that returns the file; the stamp page is HTML.
+            pdf_url = IEEE_PDF_URL.format(arnumber=arnumber) if arnumber else stamp_url
+            if not pdf_url:
+                continue
+
+            candidates.append(
+                PdfCandidate(
+                    url=pdf_url,
+                    provider="ieee",
+                    license=license,
+                    kind="pdf",
+                    is_open_access=is_free,
+                    public_url=landing or stamp_url or pdf_url,
+                )
+            )
+        return candidates
+
+    async def _from_acm(self, query: PdfQuery) -> list[PdfCandidate] | None:
+        """Try the ACM DL's direct PDF route for ACM DOIs.
+
+        The ACM has no public API, so the only handle is the well-known
+        ``dl.acm.org/doi/pdf/<doi>`` URL. Since ACM Open a large part of the
+        library is free; ``acm_dl_cookie`` (the Cookie header of a signed-in
+        session) adds whatever your institution subscribes to on top.
+
+        The site sits behind Cloudflare, which binds that cookie to the IP
+        address and the User-Agent it was issued to. The cookie therefore only
+        works from the network it was captured on, and ``acm_dl_user_agent``
+        must carry the browser's exact User-Agent string.
+        """
+        doi = query.clean_doi
+        if not doi or not belongs_to_publisher(query, ACM_DOI_PREFIXES, ACM_HOSTS):
+            return None
+
+        headers: dict[str, str] = {}
+        if self.acm_dl_cookie:
+            headers["Cookie"] = self.acm_dl_cookie
+            if self.acm_dl_user_agent:
+                headers["User-Agent"] = self.acm_dl_user_agent
+        return [
+            PdfCandidate(
+                url=f"https://dl.acm.org/doi/pdf/{doi}",
+                provider="acm",
+                kind="pdf",
+                # Whether this particular article is free is unknown until the
+                # download either works or is refused.
+                is_open_access=False,
+                headers=headers,
+                public_url=f"https://dl.acm.org/doi/{doi}",
+            )
+        ]
+
+    async def _with_looked_up_doi(self, query: PdfQuery) -> tuple[PdfQuery, list[str]]:
+        """Fill in a missing DOI from Scopus so every later provider can use it.
+
+        Records imported from a database export without a DOI are otherwise
+        stuck with title search everywhere. Returns the query unchanged, plus
+        the providers already consumed, when there is nothing to look up.
+        """
+        if query.clean_doi or not query.clean_title or not self.elsevier_api_key:
+            return query, []
+
+        try:
+            doi = await self._scopus_doi(query)
+        except Exception as exc:  # a flaky provider must not kill the batch
+            logger.warning("Scopus DOI lookup failed: %s", exc)
+            return query, ["scopus"]
+
+        if not doi:
+            return query, ["scopus"]
+
+        logger.info("Scopus resolved '%s' to DOI %s", (query.title or "")[:60], doi)
+        return replace(query, doi=doi), ["scopus"]
+
+    async def _scopus_doi(self, query: PdfQuery) -> str | None:
+        """Search Scopus by title and return the DOI of a confident match."""
+        title = query.clean_title
+        if not title:
+            return None
+
+        # Quotes would terminate the TITLE() clause; braces are Scopus' literal
+        # string form and cope with punctuation better than a loose phrase.
+        escaped = title.replace("{", " ").replace("}", " ").strip()
+        params: dict[str, str | int] = {
+            "query": f"TITLE({{{escaped}}})",
+            "count": 5,
+            "field": "dc:title,prism:doi,prism:coverDate",
+        }
+        async with _limiter("elsevier"):
+            response = await self.client.get(
+                "https://api.elsevier.com/content/search/scopus",
+                params=params,
+                headers={**self._elsevier_headers(), "Accept": "application/json"},
+                timeout=settings.pdf_retrieval_timeout_seconds,
+            )
+        if response.status_code != 200:
+            logger.info("Scopus search returned %s", response.status_code)
+            return None
+
+        entries = (response.json().get("search-results") or {}).get("entry") or []
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry.get("prism:doi"):
+                continue
+            if titles_match(title, entry.get("dc:title")):
+                return str(entry["prism:doi"])
+        return None
+
+    def _elsevier_headers(self) -> dict[str, str]:
+        """Elsevier authenticates with a key header, plus a token when off-campus."""
+        headers = {**self._headers(), "X-ELS-APIKey": self.elsevier_api_key}
+        if self.elsevier_inst_token:
+            headers["X-ELS-Insttoken"] = self.elsevier_inst_token
+        return headers
+
+    async def _from_landing_page(self, query: PdfQuery) -> list[PdfCandidate] | None:
         """Last resort: read ``citation_pdf_url`` off the source's own URL.
 
         This is a guess, not a known open-access copy, so it is flagged as such
@@ -614,7 +936,7 @@ class PdfRetrievalService:
         """
         url = (query.url or "").strip()
         if not url or not url.startswith("http"):
-            return []
+            return None
 
         return [
             PdfCandidate(url=url, provider="landing-page", kind="landing", is_open_access=False)

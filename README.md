@@ -150,6 +150,12 @@ GOOGLE_API_KEY="your-google-key-here"
 LLM_PROVIDER="claude"
 # Required for Unpaywall lookups when fetching open-access PDFs
 OA_CONTACT_EMAIL="you@example.org"
+# Optional publisher keys. Each one adds a database to the PDF search
+ELSEVIER_API_KEY=""   # Scopus + ScienceDirect, from https://dev.elsevier.com
+ELSEVIER_INST_TOKEN="" # Institutional token from your library (paywalled Elsevier articles)
+IEEE_API_KEY=""       # IEEE Xplore, from https://developer.ieee.org
+ACM_DL_COOKIE=""      # Cookie header of a signed-in dl.acm.org session
+ACM_DL_USER_AGENT=""  # User-Agent header of that same browser session
 EOF
 
 # Start the service
@@ -196,6 +202,33 @@ Python service runs on **http://localhost:8000**
 | `PDF_RETRIEVAL_TIMEOUT_SECONDS` | Timeout per open-access API call and PDF download | `30` |
 | `PDF_RETRIEVAL_MAX_MB` | Largest PDF that will be downloaded | `50` |
 | `SEMANTIC_SCHOLAR_API_KEY` | Optional key from https://www.semanticscholar.org/product/api. Without it, Semantic Scholar throttles batch lookups with HTTP 429 | - |
+| `ELSEVIER_API_KEY` | Elsevier developer key (`SCOPUS_API_KEY` works too). Scopus title-to-DOI lookup and ScienceDirect PDFs; see [Publisher API keys](#publisher-api-keys-for-pdf-retrieval) | - |
+| `ELSEVIER_INST_TOKEN` | Institutional token from your library, for paywalled Elsevier articles | - |
+| `IEEE_API_KEY` | IEEE Xplore developer key; the free tier allows 200 calls a day | - |
+| `ACM_DL_COOKIE` | `Cookie` header of a signed-in dl.acm.org session; capture steps below | - |
+| `ACM_DL_USER_AGENT` | `User-Agent` header from the same request as the cookie | - |
+
+### Publisher API keys for PDF retrieval
+
+"Fetch Open-Access PDFs" on the Sources page tries, for each source without a PDF: arXiv, Elsevier, ACM DL, Unpaywall, OpenAlex, Semantic Scholar, IEEE Xplore, and the source's own landing page. The open-access indexes need only `OA_CONTACT_EMAIL`. The publisher keys are optional; each is used only for records of that publisher, and a missing key skips it. Keep them in the gitignored `python-service/.env` and restart the service after changing them.
+
+| Key | Where to get it | What it gives you | Limits |
+|-----|-----------------|-------------------|--------|
+| `ELSEVIER_API_KEY` | Free at https://dev.elsevier.com under "My API Key". | Full text for articles Elsevier flags as open access (Heliyon, OA-marked IFAC or Procedia papers). Without the key these fail because ScienceDirect blocks direct downloads. Also the Scopus title-to-DOI lookup for records without a DOI. | Paywalled articles: the API returns a first-page preview, even from the university network or VPN. |
+| `ELSEVIER_INST_TOKEN` | From your library; Elsevier issues it per institution. | Paywalled articles through the same API, from any network. | Cannot be self-generated. |
+| `IEEE_API_KEY` | Free at https://developer.ieee.org; 200 calls a day, so the resolver only runs for IEEE DOIs. | Metadata by DOI or title, and the PDF of open-access papers (IEEE Access, CC BY). | Locked papers, which are reported with an Xplore link for manual upload. |
+| `ACM_DL_COOKIE` + `ACM_DL_USER_AGENT` | See below. | Subscriber access to dl.acm.org through your institutional login. | Expires with the browser session; capture it again then. |
+| `SEMANTIC_SCHOLAR_API_KEY` | https://www.semanticscholar.org/product/api (free, approval takes days). | Lifts the HTTP 429 throttling. | Its links mostly overlap with Unpaywall and OpenAlex, so it is safe to leave empty. |
+
+The ACM Digital Library has no API and sits behind Cloudflare, which ties the session cookie to the IP address and browser it was issued to. To capture it:
+
+1. Be on the network the python service will run from.
+2. Sign in to https://dl.acm.org through your institution and open any article.
+3. Open the developer tools (Safari: Develop > Connect Web Inspector, after enabling the Develop menu under Settings > Advanced; Chrome/Firefox: F12), go to the Network tab and reload.
+4. Click the first `dl.acm.org` request and copy its `Cookie` request header into `ACM_DL_COOKIE` and its `User-Agent` into `ACM_DL_USER_AGENT`, keeping every cookie (both `cf_clearance` entries if there are two).
+5. Restart the python service.
+
+The cookie is a live login: treat it like a password and never commit it. When ACM downloads are refused again, the session has expired and steps 2 to 5 need repeating.
 
 ---
 

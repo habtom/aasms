@@ -4,11 +4,17 @@ import httpx
 import pytest
 
 from src.services.pdf_retrieval_service import (
+    ELSEVIER_DOI_PREFIXES,
+    ELSEVIER_HOSTS,
+    IEEE_DOI_PREFIXES,
+    IEEE_HOSTS,
     PdfCandidate,
     PdfQuery,
     PdfRetrievalService,
+    belongs_to_publisher,
     describe_failure,
     extract_arxiv_id,
+    ieee_access_is_free,
     order_candidates,
     titles_match,
 )
@@ -597,3 +603,544 @@ async def test_no_api_key_header_without_configuration(monkeypatch):
         await service.retrieve(PdfQuery(doi="10.1145/1", title="Paper"))
 
     assert seen and not any(seen)
+
+
+# ---------------------------------------------------------------- publisher APIs
+
+
+def configure_publishers(
+    monkeypatch,
+    *,
+    elsevier: str = "",
+    inst_token: str = "",
+    ieee: str = "",
+    acm_cookie: str = "",
+    acm_user_agent: str = "",
+    contact_email: str = "",
+) -> None:
+    """Pin every credential the service reads, so a real .env cannot leak in."""
+    for name, value in (
+        ("oa_contact_email", contact_email),
+        ("semantic_scholar_api_key", ""),
+        ("elsevier_api_key", elsevier),
+        ("elsevier_inst_token", inst_token),
+        ("ieee_api_key", ieee),
+        ("acm_dl_cookie", acm_cookie),
+        ("acm_dl_user_agent", acm_user_agent),
+    ):
+        monkeypatch.setattr(f"src.services.pdf_retrieval_service.settings.{name}", value)
+
+
+@pytest.mark.asyncio
+async def test_elsevier_article_retrieval_uses_the_api_key(monkeypatch):
+    configure_publishers(monkeypatch, elsevier="els-key", inst_token="inst-token")
+    seen: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.elsevier.com":
+            seen["key"] = request.headers.get("x-els-apikey")
+            seen["token"] = request.headers.get("x-els-insttoken")
+            seen["accept"] = request.headers.get("accept")
+            return httpx.Response(200, content=PDF_BYTES)
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1016/j.trc.2023.104123", title="Paper"))
+
+    assert result.found is True
+    assert result.provider == "elsevier"
+    assert seen == {
+        "key": "els-key",
+        "token": "inst-token",
+        "accept": "application/pdf",
+    }
+    # Provenance keeps a link a reader can open, not the credentialed endpoint.
+    assert result.source_url == "https://doi.org/10.1016/j.trc.2023.104123"
+
+
+@pytest.mark.asyncio
+async def test_elsevier_is_skipped_for_a_foreign_doi(monkeypatch):
+    configure_publishers(monkeypatch, elsevier="els-key")
+    hosts: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1109/TITS.2023.1", title="Paper"))
+
+    assert "api.elsevier.com" not in hosts
+    # A resolver that did not apply must not be reported as checked.
+    assert "elsevier" not in result.providers_tried
+
+
+@pytest.mark.asyncio
+async def test_elsevier_is_skipped_without_a_key(monkeypatch):
+    configure_publishers(monkeypatch)
+    hosts: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1016/j.trc.2023.1", title="Paper"))
+
+    assert "api.elsevier.com" not in hosts
+    assert "elsevier" not in result.providers_tried
+
+
+@pytest.mark.asyncio
+async def test_paywalled_elsevier_article_is_not_reported_as_open_access(monkeypatch):
+    """A refused download must not turn the API endpoint into an 'open copy' link."""
+    configure_publishers(monkeypatch, elsevier="els-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1016/j.trc.2023.1", title="Paper"))
+
+    assert result.found is False
+    assert result.open_access_urls() == []
+    assert "els-key" not in (result.reason or "")
+
+
+@pytest.mark.asyncio
+async def test_scopus_fills_in_a_missing_doi(monkeypatch):
+    configure_publishers(monkeypatch, elsevier="els-key", contact_email="test@example.org")
+    unpaywall_dois: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if request.url.host == "api.elsevier.com" and "/search/scopus" in url:
+            assert request.headers.get("x-els-apikey") == "els-key"
+            return json_response(
+                {
+                    "search-results": {
+                        "entry": [
+                            {"dc:title": "Some other paper", "prism:doi": "10.1000/wrong"},
+                            {
+                                "dc:title": "Cooperative Awareness in CAVs",
+                                "prism:doi": "10.1109/TITS.2023.7",
+                            },
+                        ]
+                    }
+                }
+            )
+        if "api.unpaywall.org" in url:
+            unpaywall_dois.append(request.url.path.removeprefix("/v2/"))
+            return json_response(
+                {"best_oa_location": {"url_for_pdf": "https://repo.example.org/oa.pdf"}}
+            )
+        if url == "https://repo.example.org/oa.pdf":
+            return httpx.Response(200, content=PDF_BYTES)
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(title="Cooperative Awareness in CAVs"))
+
+    assert result.found is True
+    assert result.providers_tried[0] == "scopus"
+    assert unpaywall_dois == ["10.1109/tits.2023.7"]
+
+
+@pytest.mark.asyncio
+async def test_scopus_lookup_is_skipped_when_a_doi_is_known(monkeypatch):
+    configure_publishers(monkeypatch, elsevier="els-key")
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        await service.retrieve(PdfQuery(doi="10.1145/1", title="Paper"))
+
+    assert "/content/search/scopus" not in paths
+
+
+@pytest.mark.asyncio
+async def test_scopus_ignores_a_different_paper(monkeypatch):
+    configure_publishers(monkeypatch, elsevier="els-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/search/scopus" in str(request.url):
+            return json_response(
+                {
+                    "search-results": {
+                        "entry": [
+                            {"dc:title": "Traffic light control with RL", "prism:doi": "10.1000/x"}
+                        ]
+                    }
+                }
+            )
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(title="Cooperative Awareness in CAVs"))
+
+    assert result.found is False
+    assert "scopus" in result.providers_tried
+
+
+@pytest.mark.asyncio
+async def test_ieee_open_access_article_is_downloaded(monkeypatch):
+    configure_publishers(monkeypatch, ieee="ieee-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "ieeexploreapi.ieee.org":
+            assert request.url.params["apikey"] == "ieee-key"
+            assert request.url.params["doi"] == "10.1109/tits.2023.7"
+            return json_response(
+                {
+                    "articles": [
+                        {
+                            "title": "Paper",
+                            "access_type": "OPEN_ACCESS",
+                            "pdf_url": "https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=7",
+                            "html_url": "https://ieeexplore.ieee.org/document/7",
+                        }
+                    ]
+                }
+            )
+        if request.url.host == "ieeexplore.ieee.org":
+            return httpx.Response(200, content=PDF_BYTES)
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1109/TITS.2023.7", title="Paper"))
+
+    assert result.found is True
+    assert result.provider == "ieee"
+    assert result.license == "IEEE Open Access"
+    assert result.source_url == "https://ieeexplore.ieee.org/document/7"
+
+
+@pytest.mark.asyncio
+async def test_ieee_open_access_link_is_offered_when_xplore_blocks_the_download(monkeypatch):
+    configure_publishers(monkeypatch, ieee="ieee-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "ieeexploreapi.ieee.org":
+            return json_response(
+                {
+                    "articles": [
+                        {
+                            "title": "Paper",
+                            "access_type": "Open Access",
+                            "pdf_url": "https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=7",
+                            "html_url": "https://ieeexplore.ieee.org/document/7",
+                        }
+                    ]
+                }
+            )
+        return httpx.Response(418, content=b"<html>bot wall</html>")
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1109/TITS.2023.7", title="Paper"))
+
+    assert result.found is False
+    assert result.open_access_urls() == ["https://ieeexplore.ieee.org/document/7"]
+    assert "ieeexplore.ieee.org" in result.reason
+
+
+@pytest.mark.asyncio
+async def test_ieee_locked_article_is_not_reported_as_open_access(monkeypatch):
+    configure_publishers(monkeypatch, ieee="ieee-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "ieeexploreapi.ieee.org":
+            return json_response(
+                {
+                    "articles": [
+                        {
+                            "title": "Paper",
+                            "access_type": "Locked",
+                            "pdf_url": "https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=7",
+                            "html_url": "https://ieeexplore.ieee.org/document/7",
+                        }
+                    ]
+                }
+            )
+        return httpx.Response(403)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1109/TITS.2023.7", title="Paper"))
+
+    assert result.found is False
+    assert result.open_access_urls() == []
+    assert result.reason.startswith("No open-access copy found")
+
+
+@pytest.mark.asyncio
+async def test_ieee_downloads_from_the_getpdf_endpoint_not_the_stamp_page(monkeypatch):
+    """The API's pdf_url is an HTML page with the PDF in an iframe."""
+    configure_publishers(monkeypatch, ieee="ieee-key")
+    downloads: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "ieeexploreapi.ieee.org":
+            return json_response(
+                {
+                    "articles": [
+                        {
+                            "title": "Paper",
+                            "article_number": "9305204",
+                            "access_type": "OPEN_ACCESS",
+                            "pdf_url": "https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=9305204",
+                            "html_url": "https://ieeexplore.ieee.org/document/9305204",
+                        }
+                    ]
+                }
+            )
+        if request.url.host == "ieeexplore.ieee.org":
+            downloads.append(request.url.path)
+            if request.url.path == "/stampPDF/getPDF.jsp":
+                assert request.url.params["arnumber"] == "9305204"
+                return httpx.Response(200, content=PDF_BYTES)
+            return httpx.Response(200, content=b"<html><iframe src='x.pdf'></iframe></html>")
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1109/ACCESS.2020.3046999"))
+
+    assert result.found is True
+    assert result.provider == "ieee"
+    assert downloads == ["/stampPDF/getPDF.jsp"]
+    assert result.source_url == "https://ieeexplore.ieee.org/document/9305204"
+
+
+@pytest.mark.asyncio
+async def test_ieee_creative_commons_article_counts_as_open_access(monkeypatch):
+    configure_publishers(monkeypatch, ieee="ieee-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "ieeexploreapi.ieee.org":
+            return json_response(
+                {
+                    "articles": [
+                        {
+                            "title": "Paper",
+                            "article_number": "9305204",
+                            "access_type": (
+                                "CCBY - IEEE is not the copyright holder of this material. "
+                                "Please follow the instructions via "
+                                "https://creativecommons.org/licenses/by/4.0/ to obtain "
+                                "full-text articles and stipulations in the API documentation."
+                            ),
+                            "pdf_url": "https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=9305204",
+                            "html_url": "https://ieeexplore.ieee.org/document/9305204",
+                        }
+                    ]
+                }
+            )
+        if request.url.host == "ieeexplore.ieee.org":
+            # Xplore refuses the bot: the record must still count as open access
+            return httpx.Response(403)
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1109/ACCESS.2020.3046999"))
+
+    assert result.found is False
+    ieee = [c for c in result.candidates if c.provider == "ieee"]
+    assert ieee and ieee[0].is_open_access is True
+    assert ieee[0].license == "CC BY"
+    assert result.open_access_urls() == ["https://ieeexplore.ieee.org/document/9305204"]
+
+
+def test_ieee_access_is_free_reads_only_the_first_token():
+    assert ieee_access_is_free("OPEN_ACCESS") == (True, "IEEE Open Access")
+    assert ieee_access_is_free("Ephemera") == (True, "IEEE Open Access")
+    assert ieee_access_is_free("CCBY - IEEE is not the copyright holder of this material.") == (
+        True,
+        "CC BY",
+    )
+    assert ieee_access_is_free("CCBYNCND - ...") == (True, "CC BYNCND")
+    assert ieee_access_is_free("LOCKED") == (False, None)
+    assert ieee_access_is_free(None) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_ieee_searches_by_title_when_the_record_has_no_doi(monkeypatch):
+    configure_publishers(monkeypatch, ieee="ieee-key")
+    titles: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "ieeexploreapi.ieee.org":
+            titles.append(request.url.params["article_title"])
+            return json_response(
+                {
+                    "articles": [
+                        {
+                            "title": "A totally different paper",
+                            "access_type": "OPEN_ACCESS",
+                            "pdf_url": "https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=9",
+                        }
+                    ]
+                }
+            )
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(title="Cooperative Awareness in CAVs"))
+
+    assert titles == ["Cooperative Awareness in CAVs"]
+    # The title did not match, so the mismatched article is never downloaded.
+    assert result.found is False
+
+
+@pytest.mark.asyncio
+async def test_ieee_is_skipped_for_a_foreign_doi(monkeypatch):
+    configure_publishers(monkeypatch, ieee="ieee-key")
+    hosts: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1145/3597503", title="Paper"))
+
+    assert "ieeexploreapi.ieee.org" not in hosts
+    assert "ieee" not in result.providers_tried
+
+
+@pytest.mark.asyncio
+async def test_acm_pdf_is_fetched_with_the_session_cookie(monkeypatch):
+    """Cloudflare binds the cookie to the browser, so its User-Agent goes along."""
+    configure_publishers(
+        monkeypatch, acm_cookie="MAID=abc; JSESSIONID=xyz", acm_user_agent="Mozilla/5.0 Safari/26"
+    )
+    seen: list[tuple[str | None, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "dl.acm.org":
+            seen.append((request.headers.get("cookie"), request.headers.get("user-agent")))
+            return httpx.Response(200, content=PDF_BYTES)
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1145/3597503.3623301", title="Paper"))
+
+    assert result.found is True
+    assert result.provider == "acm"
+    assert seen == [("MAID=abc; JSESSIONID=xyz", "Mozilla/5.0 Safari/26")]
+    assert result.source_url == "https://dl.acm.org/doi/10.1145/3597503.3623301"
+
+
+@pytest.mark.asyncio
+async def test_acm_credentials_are_used_even_when_unpaywall_lists_the_same_url(monkeypatch):
+    """Unpaywall hands back the identical dl.acm.org URL without credentials.
+
+    A URL is only downloaded once, so the credentialed attempt must come first
+    or the cookie is never sent at all.
+    """
+    configure_publishers(monkeypatch, acm_cookie="JSESSIONID=xyz", contact_email="me@example.org")
+    pdf_url = "https://dl.acm.org/doi/pdf/10.1145/3597503.3623301"
+    acm_requests: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.unpaywall.org":
+            return json_response(
+                {"best_oa_location": {"url_for_pdf": pdf_url, "host_type": "publisher"}}
+            )
+        if request.url.host == "dl.acm.org":
+            acm_requests.append(request.headers.get("cookie"))
+            if request.headers.get("cookie"):
+                return httpx.Response(200, content=PDF_BYTES)
+            return httpx.Response(403, content=b"<html>challenge</html>")
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1145/3597503.3623301"))
+
+    assert result.found is True
+    assert result.provider == "acm"
+    assert acm_requests == ["JSESSIONID=xyz"]
+
+
+@pytest.mark.asyncio
+async def test_acm_is_tried_without_a_cookie(monkeypatch):
+    """Since ACM Open much of the DL is free, so the attempt is worth making."""
+    configure_publishers(monkeypatch)
+    urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        urls.append(str(request.url))
+        if request.url.host == "dl.acm.org":
+            assert "cookie" not in request.headers
+            return httpx.Response(200, content=PDF_BYTES)
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        result = await service.retrieve(PdfQuery(doi="10.1145/3597503.3623301"))
+
+    assert result.found is True
+    assert "https://dl.acm.org/doi/pdf/10.1145/3597503.3623301" in urls
+
+
+@pytest.mark.asyncio
+async def test_acm_is_skipped_for_a_foreign_doi(monkeypatch):
+    configure_publishers(monkeypatch)
+    hosts: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        await service.retrieve(PdfQuery(doi="10.1109/TITS.2023.7", title="Paper"))
+
+    assert "dl.acm.org" not in hosts
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidates_reports_public_links_not_api_endpoints(monkeypatch):
+    configure_publishers(monkeypatch, elsevier="els-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    service, client = make_service(handler)
+    async with client:
+        candidates, providers = await service.resolve_candidates(
+            PdfQuery(doi="10.1016/j.trc.2023.1", title="Paper")
+        )
+
+    elsevier = [c for c in candidates if c.provider == "elsevier"]
+    assert elsevier and elsevier[0].link == "https://doi.org/10.1016/j.trc.2023.1"
+    assert "elsevier" in providers
+
+
+def test_belongs_to_publisher_matches_on_the_source_url():
+    query = PdfQuery(url="https://www.sciencedirect.com/science/article/pii/S1")
+
+    assert belongs_to_publisher(query, ELSEVIER_DOI_PREFIXES, ELSEVIER_HOSTS)
+    assert not belongs_to_publisher(query, IEEE_DOI_PREFIXES, IEEE_HOSTS)
+
+
+def test_describe_failure_names_the_providers_that_were_asked():
+    reason = describe_failure([], ["unpaywall", "ieee", "acm", "landing-page"])
+
+    assert reason == "No open-access copy found (checked Unpaywall, IEEE Xplore, ACM DL)"
