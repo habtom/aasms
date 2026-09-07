@@ -62,7 +62,7 @@ export async function POST(request: NextRequest, { params }: SuggestRouteParams)
         facet_name: facet.name,
         facet_description: facet.description,
         min_categories: 3,
-        max_categories: 10,
+        max_categories: 12,
       }),
     });
 

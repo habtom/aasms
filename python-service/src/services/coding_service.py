@@ -24,7 +24,7 @@ class CodingService:
         facet_name: str,
         facet_description: str | None = None,
         min_categories: int = 3,
-        max_categories: int = 10,
+        max_categories: int = 12,
     ) -> dict[str, Any]:
         """
         Generate category suggestions from a list of OPEN facet keywords.
@@ -59,7 +59,9 @@ The researcher has a facet called "{facet_name}" that collected keywords/phrases
 Here are all the unique keywords/phrases extracted:
 {values_list}
 
-Your task is to group these values into {min_categories}-{max_categories} meaningful categories.
+Your task is to group these values into at most {max_categories} categories (and at least {min_categories}).
+
+HARD CONSTRAINT: the "categories" array must contain no more than {max_categories} entries. If you want more, merge the closest ones instead. A broader category is always preferable to exceeding the limit.
 
 Guidelines:
 1. Categories should be mutually exclusive and collectively exhaustive
@@ -67,6 +69,7 @@ Guidelines:
 3. Group semantically similar values together (synonyms, related concepts)
 4. Create an "Other/Unclassified" category only for truly miscellaneous values
 5. Each category should have at least 2 values if possible
+6. Never return more than {max_categories} categories
 
 Respond with a JSON object containing:
 - categories: array of objects with name (string), description (string), and values (array of strings that belong to this category)
@@ -160,6 +163,15 @@ Important: Include ALL values from the input in either a category or uncategoriz
                     uncategorized.append(v)
             uncategorized.extend(v for v in values if v not in seen)
 
+            # The cap is a prompt instruction, and the model overshoots it on
+            # large facets.
+            # Merge back down rather than handing the wizard a schema the
+            # researcher then has to collapse by hand.
+            if len(formatted_categories) > max_categories:
+                formatted_categories = await self._enforce_category_cap(
+                    formatted_categories, facet_name, max_categories
+                )
+
             return {
                 "categories": formatted_categories,
                 "uncategorized": uncategorized,
@@ -169,6 +181,106 @@ Important: Include ALL values from the input in either a category or uncategoriz
         except Exception as e:
             logger.error(f"Error suggesting categories: {e}")
             raise
+
+    async def _enforce_category_cap(
+        self,
+        categories: list[dict[str, Any]],
+        facet_name: str,
+        max_categories: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Merge an over-long category list down to ``max_categories``.
+
+        Only the category names and descriptions go to the model, never the
+        values themselves — the merge decision does not need them, and echoing
+        a large facet's values a second time is what makes the first pass
+        overflow. Values are re-attached locally, so no value can be lost or
+        duplicated by the merge.
+        """
+        by_name = {c["name"]: c for c in categories}
+        listing = "\n".join(
+            f'- {c["name"]} ({len(c["values"])} values): {c.get("description", "")}'
+            for c in categories
+        )
+
+        prompt = f"""A researcher coded the facet "{facet_name}" and ended up with \
+{len(categories)} categories, which is more than the {max_categories} they can use.
+
+Current categories:
+{listing}
+
+Merge them into at most {max_categories} groups. Every current category must appear in \
+exactly one group. Merge the most closely related ones; keep the largest categories intact \
+where you can.
+
+Respond with a JSON object containing:
+- groups: array of objects with name (string), description (string), and members (array of \
+the current category names that belong to this group)"""
+
+        response_schema = {
+            "groups": [{"name": "string", "description": "string", "members": ["string"]}]
+        }
+
+        try:
+            result = await self.llm_provider.generate_structured_output(
+                prompt=prompt,
+                response_schema=response_schema,
+                max_tokens=4000,
+            )
+        except Exception as e:  # a failed merge must not lose the coding run
+            logger.warning("Category cap merge failed for '%s': %s", facet_name, e)
+            result = {}
+
+        merged: list[dict[str, Any]] = []
+        claimed: set[str] = set()
+        for group in result.get("groups", []):
+            if not isinstance(group, dict):
+                continue
+            members = [
+                m for m in group.get("members", []) if m in by_name and m not in claimed
+            ]
+            if not members:
+                continue
+            claimed.update(members)
+            values: list[str] = []
+            for m in members:
+                values.extend(by_name[m]["values"])
+            merged.append(
+                {
+                    "name": group.get("name") or by_name[members[0]]["name"],
+                    "description": group.get("description", ""),
+                    "values": values,
+                    "source_count": len(values),
+                }
+            )
+
+        # Anything the model forgot to place keeps its own group for now; the
+        # deterministic pass below is what actually guarantees the cap.
+        merged.extend(c for c in categories if c["name"] not in claimed)
+
+        if len(merged) > max_categories:
+            merged.sort(key=lambda c: len(c["values"]), reverse=True)
+            kept, overflow = merged[: max_categories - 1], merged[max_categories - 1 :]
+            spill: list[str] = []
+            for c in overflow:
+                spill.extend(c["values"])
+            logger.warning(
+                "Category cap for '%s' still exceeded after merge; folding %d "
+                "categories into 'Other'",
+                facet_name,
+                len(overflow),
+            )
+            kept.append(
+                {
+                    "name": "Other",
+                    "description": "Categories that could not be merged elsewhere.",
+                    "values": spill,
+                    "source_count": len(spill),
+                }
+            )
+            merged = kept
+
+        return merged
 
     async def classify_value(
         self,

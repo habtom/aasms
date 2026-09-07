@@ -242,3 +242,129 @@ async def test_category_left_empty_after_dedupe_is_dropped():
     result = await CodingService(provider).suggest_categories(["MILP"], "Coordination mechanism")
 
     assert [c["name"] for c in result["categories"]] == ["A"]
+
+
+class ScriptedProvider:
+    """Replays one canned response per call, in order, recording each prompt."""
+
+    def __init__(self, *responses):
+        self._responses = list(responses)
+        self.prompts = []
+
+    async def generate_structured_output(self, prompt, response_schema, max_tokens, **kwargs):
+        self.prompts.append(prompt)
+        return self._responses.pop(0) if self._responses else {}
+
+
+def _cats(n, per=2):
+    """n suggested categories, each holding `per` distinct values."""
+    return [
+        {
+            "name": f"Cat {i}",
+            "description": f"d{i}",
+            "values": [f"v{i}-{j}" for j in range(per)],
+        }
+        for i in range(n)
+    ]
+
+
+def _values(n, per=2):
+    return [f"v{i}-{j}" for i in range(n) for j in range(per)]
+
+
+@pytest.mark.asyncio
+async def test_cap_is_not_enforced_when_the_model_stays_within_it():
+    provider = ScriptedProvider({"categories": _cats(5), "uncategorized": [], "reasoning": ""})
+
+    result = await CodingService(provider).suggest_categories(
+        _values(5), "Coordination mechanism", max_categories=12
+    )
+
+    assert len(result["categories"]) == 5
+    assert len(provider.prompts) == 1  # no merge pass
+
+
+@pytest.mark.asyncio
+async def test_overshooting_model_is_merged_back_to_the_cap():
+    """Regression: a large facet came back with far more categories than the cap."""
+    merge = {
+        "groups": [
+            {"name": "A", "description": "", "members": [f"Cat {i}" for i in range(0, 11)]},
+            {"name": "B", "description": "", "members": [f"Cat {i}" for i in range(11, 21)]},
+        ]
+    }
+    provider = ScriptedProvider(
+        {"categories": _cats(21), "uncategorized": [], "reasoning": ""}, merge
+    )
+
+    result = await CodingService(provider).suggest_categories(
+        _values(21), "Coordination mechanism", max_categories=12
+    )
+
+    assert [c["name"] for c in result["categories"]] == ["A", "B"]
+    assert sum(len(c["values"]) for c in result["categories"]) == 42
+
+
+@pytest.mark.asyncio
+async def test_merge_never_loses_or_duplicates_a_value():
+    values = _values(21)
+    # The merge model forgets three categories entirely.
+    merge = {
+        "groups": [
+            {"name": "A", "description": "", "members": [f"Cat {i}" for i in range(0, 9)]},
+            {"name": "B", "description": "", "members": [f"Cat {i}" for i in range(9, 18)]},
+        ]
+    }
+    provider = ScriptedProvider(
+        {"categories": _cats(21), "uncategorized": [], "reasoning": ""}, merge
+    )
+
+    result = await CodingService(provider).suggest_categories(
+        values, "Coordination mechanism", max_categories=12
+    )
+
+    placed = [v for c in result["categories"] for v in c["values"]] + result["uncategorized"]
+    assert sorted(placed) == sorted(values)
+    assert len(placed) == len(set(placed))
+    assert len(result["categories"]) <= 12
+
+
+@pytest.mark.asyncio
+async def test_cap_holds_when_the_merge_pass_fails():
+    """A failed or empty merge must still not exceed the cap."""
+    provider = ScriptedProvider({"categories": _cats(21), "uncategorized": [], "reasoning": ""}, {})
+
+    result = await CodingService(provider).suggest_categories(
+        _values(21), "Coordination mechanism", max_categories=12
+    )
+
+    assert len(result["categories"]) == 12
+    assert result["categories"][-1]["name"] == "Other"
+    placed = [v for c in result["categories"] for v in c["values"]]
+    assert sorted(placed) == sorted(_values(21))
+
+
+@pytest.mark.asyncio
+async def test_merge_prompt_omits_the_values():
+    """Re-sending every value is what overflows the first pass; names suffice."""
+    provider = ScriptedProvider({"categories": _cats(21), "uncategorized": [], "reasoning": ""}, {})
+
+    await CodingService(provider).suggest_categories(
+        _values(21), "Coordination mechanism", max_categories=12
+    )
+
+    merge_prompt = provider.prompts[1]
+    assert "Cat 0" in merge_prompt
+    assert "v0-0" not in merge_prompt
+
+
+@pytest.mark.asyncio
+async def test_prompt_states_the_cap_as_a_hard_constraint():
+    provider = ScriptedProvider({"categories": [], "uncategorized": [], "reasoning": ""})
+
+    await CodingService(provider).suggest_categories(
+        ["a", "b"], "Coordination mechanism", max_categories=12
+    )
+
+    assert "at most 12 categories" in provider.prompts[0]
+    assert "HARD CONSTRAINT" in provider.prompts[0]

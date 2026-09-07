@@ -34,7 +34,7 @@ class SuggestCategoriesRequest(BaseModel):
         3, ge=2, le=20, description="Minimum number of categories to suggest"
     )
     max_categories: int = Field(
-        10, ge=3, le=30, description="Maximum number of categories to suggest"
+        12, ge=3, le=30, description="Maximum number of categories to suggest"
     )
 
 
