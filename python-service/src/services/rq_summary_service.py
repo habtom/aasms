@@ -184,5 +184,19 @@ class RQSummaryService:
         sections.append(
             '4. "gaps": Areas where more research is needed based on the data'
         )
+        # The Claude path ignores response_schema and system_prompt, so the prompt is
+        # the only place the JSON contract can be stated. Without it the model answers
+        # in Markdown, the reply fails to parse, and every RQ falls back to the
+        # "Failed to generate summary" row.
+        sections.append("")
+        sections.append("=== Output Format ===")
+        sections.append(
+            "Respond with a single JSON object and nothing else - no Markdown headings, "
+            "no prose before or after, no code fences around anything but the JSON:"
+        )
+        sections.append(
+            '{"summary": "<paragraph>", "key_findings": ["<finding>", ...], '
+            '"evidence_quality": "strong|moderate|limited", "gaps": ["<gap>", ...]}'
+        )
 
         return "\n".join(sections)

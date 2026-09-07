@@ -163,6 +163,27 @@ async def test_prompt_includes_question_and_facet_data(sample_facet_data, sample
 
 
 @pytest.mark.asyncio
+async def test_prompt_demands_bare_json(sample_facet_data, sample_sources):
+    """The Claude path drops response_schema, so the prompt must ask for JSON itself.
+
+    Without this the model replies in Markdown, the parse yields {}, and every RQ
+    lands on the "Failed to generate summary" fallback.
+    """
+    service = RQSummaryService(FakeProvider())
+
+    prompt = service._build_prompt(
+        question="What approaches exist?",
+        facet_data=sample_facet_data,
+        source_evidence=sample_sources,
+    )
+
+    assert "JSON" in prompt
+    assert "no Markdown headings" in prompt
+    for field in ("summary", "key_findings", "evidence_quality", "gaps"):
+        assert f'"{field}"' in prompt
+
+
+@pytest.mark.asyncio
 async def test_facet_filtering_by_rq_id(service, sample_facet_data, sample_sources):
     """Facets not linked to a given RQ should be filtered out."""
     rqs = [
