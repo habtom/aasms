@@ -108,7 +108,7 @@ export default function SourcesPage() {
       url: `/api/studies/${studyId}/sources/batch-classify`,
     },
     "fetch-pdfs": {
-      title: "Fetching Open-Access PDFs...",
+      title: "Fetching PDFs...",
       url: `/api/studies/${studyId}/sources/batch-fetch-pdfs`,
     },
   };
@@ -265,7 +265,7 @@ export default function SourcesPage() {
                       disabled={counts.missing_pdf === 0}
                     >
                       <FileDown className="h-4 w-4 mr-2" />
-                      <span>Fetch Open-Access PDFs ({counts.missing_pdf})</span>
+                      <span>Fetch PDFs ({counts.missing_pdf})</span>
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>

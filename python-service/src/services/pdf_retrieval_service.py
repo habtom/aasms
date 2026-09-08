@@ -127,7 +127,7 @@ PROVIDER_LABELS = {
     "openalex": "OpenAlex",
     "semantic-scholar": "Semantic Scholar",
     "scopus": "Scopus",
-    "elsevier": "ScienceDirect",
+    "elsevier": "Elsevier",
     "ieee": "IEEE Xplore",
     "acm": "ACM DL",
 }
@@ -277,12 +277,12 @@ def describe_failure(
             if label and label not in checked:
                 checked.append(label)
         listed = ", ".join(checked) or "Unpaywall, OpenAlex, Semantic Scholar, arXiv"
-        return f"No open-access copy found (checked {listed})"
+        return f"No downloadable copy found (checked {listed})"
 
     hosts = sorted({urlparse(c.link).hostname or "?" for c in open_access})
     return (
-        f"Open-access copy listed at {', '.join(hosts[:3])} but the host refused the download "
-        "— upload the PDF manually"
+        f"Open-access copy listed at {', '.join(hosts[:3])} but the host refused the download. "
+        "Upload the PDF manually"
     )
 
 

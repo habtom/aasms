@@ -18,7 +18,7 @@ const mockMinio = vi.hoisted(() => ({
 vi.mock("@/lib/db", () => ({ prisma: mockPrisma }));
 vi.mock("@/lib/minio", () => mockMinio);
 
-import { fetchAndStoreOpenAccessPdf, type PdfRetrievalSource } from "./pdf-retrieval";
+import { fetchAndStoreOpenAccessPdf, type PdfRetrievalSource, providerLabel } from "./pdf-retrieval";
 
 const baseSource: PdfRetrievalSource = {
   id: "source-1",
@@ -207,5 +207,15 @@ describe("fetchAndStoreOpenAccessPdf", () => {
 
     expect(outcome.status).toBe("error");
     expect(mockMinio.uploadFile).not.toHaveBeenCalled();
+  });
+});
+
+describe("providerLabel", () => {
+  it("maps provider ids to display names and leaves unknown ids alone", () => {
+    expect(providerLabel("elsevier")).toBe("Elsevier");
+    expect(providerLabel("ieee")).toBe("IEEE Xplore");
+    expect(providerLabel("acm")).toBe("ACM DL");
+    expect(providerLabel("unpaywall")).toBe("Unpaywall");
+    expect(providerLabel("something-new")).toBe("something-new");
   });
 });

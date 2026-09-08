@@ -315,7 +315,7 @@ async def test_no_metadata_yields_not_found(monkeypatch):
         result = await service.retrieve(PdfQuery())
 
     assert result.found is False
-    assert result.reason.startswith("No open-access copy found")
+    assert result.reason.startswith("No downloadable copy found")
 
 
 # ------------------------------------------------- candidate ranking & reporting
@@ -356,7 +356,7 @@ def test_describe_failure_ignores_the_speculative_landing_probe():
         is_open_access=False,
     )
 
-    assert describe_failure([probe]).startswith("No open-access copy found")
+    assert describe_failure([probe]).startswith("No downloadable copy found")
 
 
 @pytest.mark.asyncio
@@ -448,7 +448,7 @@ async def test_index_landing_pages_are_never_probed(monkeypatch):
         )
 
     assert not any("scopus.com" in url for url in requested)
-    assert result.reason.startswith("No open-access copy found")
+    assert result.reason.startswith("No downloadable copy found")
 
 
 @pytest.mark.asyncio
@@ -535,7 +535,7 @@ async def test_index_hosts_listed_by_openalex_are_dropped(monkeypatch):
 
     assert not any("scopus.com" in url for url in requested)
     assert result.open_access_urls() == []
-    assert result.reason.startswith("No open-access copy found")
+    assert result.reason.startswith("No downloadable copy found")
 
 
 @pytest.mark.asyncio
@@ -881,7 +881,7 @@ async def test_ieee_locked_article_is_not_reported_as_open_access(monkeypatch):
 
     assert result.found is False
     assert result.open_access_urls() == []
-    assert result.reason.startswith("No open-access copy found")
+    assert result.reason.startswith("No downloadable copy found")
 
 
 @pytest.mark.asyncio
@@ -1143,4 +1143,4 @@ def test_belongs_to_publisher_matches_on_the_source_url():
 def test_describe_failure_names_the_providers_that_were_asked():
     reason = describe_failure([], ["unpaywall", "ieee", "acm", "landing-page"])
 
-    assert reason == "No open-access copy found (checked Unpaywall, IEEE Xplore, ACM DL)"
+    assert reason == "No downloadable copy found (checked Unpaywall, IEEE Xplore, ACM DL)"

@@ -222,7 +222,7 @@ export function BulkUploadForm({ studyId, onSuccess }: BulkUploadFormProps) {
               />
               <div className="space-y-1">
                 <Label htmlFor="fetch-pdfs" className="cursor-pointer">
-                  Fetch open-access PDFs automatically
+                  Fetch PDFs automatically
                 </Label>
                 <p className="text-xs text-muted-foreground">
                   After screening, look up each source on Unpaywall, OpenAlex, Semantic Scholar and
@@ -276,7 +276,7 @@ export function BulkUploadForm({ studyId, onSuccess }: BulkUploadFormProps) {
             <div className="text-center space-y-2 w-full max-w-md">
               <h3 className="text-lg font-medium">
                 {status === "fetching_pdfs"
-                  ? "Fetching open-access PDFs..."
+                  ? "Fetching PDFs..."
                   : "Checking relevance..."}
               </h3>
               <p className="text-sm text-muted-foreground">

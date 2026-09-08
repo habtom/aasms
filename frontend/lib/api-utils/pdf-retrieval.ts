@@ -3,7 +3,7 @@ import { generateStoragePath, initializeBucket, uploadFile } from "@/lib/minio";
 import { PYTHON_SERVICE_URL } from "@/lib/python-service";
 
 /**
- * The subset of a Source needed to look up and store its open-access PDF.
+ * The subset of a Source needed to look up and store its PDF.
  */
 export interface PdfRetrievalSource {
   id: string;
@@ -19,6 +19,23 @@ export interface PdfRetrievalSource {
 }
 
 export type PdfRetrievalStatus = "success" | "skipped" | "error";
+
+/** Display names for the python service's provider ids. */
+const PROVIDER_LABELS: Record<string, string> = {
+  "arxiv-id": "arXiv",
+  "arxiv-search": "arXiv",
+  unpaywall: "Unpaywall",
+  openalex: "OpenAlex",
+  "semantic-scholar": "Semantic Scholar",
+  elsevier: "Elsevier",
+  ieee: "IEEE Xplore",
+  acm: "ACM DL",
+  "landing-page": "the publisher page",
+};
+
+export function providerLabel(provider: string): string {
+  return PROVIDER_LABELS[provider] ?? provider;
+}
 
 export interface PdfRetrievalOutcome {
   status: PdfRetrievalStatus;
@@ -55,7 +72,8 @@ function mergeRetrievalRecord(
 }
 
 /**
- * Look up an open-access PDF for a source, store it in MinIO and flag the source.
+ * Look up a PDF for a source (open access, or via the configured publisher
+ * credentials), store it in MinIO and flag the source.
  *
  * Never throws — batch callers rely on the outcome to keep going.
  */
@@ -99,7 +117,7 @@ export async function fetchAndStoreOpenAccessPdf(
       providers_tried?: string[];
       open_access_urls?: string[];
     };
-    const reason = detail.reason || "No open-access copy found";
+    const reason = detail.reason || "No downloadable copy found";
     const openAccessUrls = detail.open_access_urls || [];
     await recordAttempt(source, {
       status: "not_found",
@@ -161,7 +179,7 @@ export async function fetchAndStoreOpenAccessPdf(
 
   return {
     status: "success",
-    message: `Retrieved via ${provider}${license ? ` (${license})` : ""}`,
+    message: `Retrieved via ${providerLabel(provider)}${license ? ` (${license})` : ""}`,
     provider,
     sourceUrl,
     license,

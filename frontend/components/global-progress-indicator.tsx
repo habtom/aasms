@@ -85,7 +85,7 @@ export function GlobalProgressIndicator() {
                 {status === "error" && <XCircle className="h-4 w-4 text-destructive" />}
 
                 {status === "importing" && "Importing Sources..."}
-                {isFetchingPdfs && "Fetching Open-Access PDFs..."}
+                {isFetchingPdfs && "Fetching PDFs..."}
                 {status === "complete" && "Import Complete"}
                 {status === "error" && "Import Failed"}
               </h4>

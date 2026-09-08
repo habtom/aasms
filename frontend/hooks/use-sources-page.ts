@@ -235,7 +235,7 @@ export function useSourcesPage() {
     }
   };
 
-  /** Retry the open-access PDF lookup for one source. */
+  /** Retry the PDF lookup for one source. */
   const handleFetchPdf = async (sourceId: string) => {
     setLoadingMap((m) => ({ ...m, [sourceId]: true }));
     try {

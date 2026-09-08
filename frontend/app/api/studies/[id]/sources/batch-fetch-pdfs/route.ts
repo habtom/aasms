@@ -20,7 +20,7 @@ const SOURCE_SELECT = {
 /**
  * POST /api/studies/[id]/sources/batch-fetch-pdfs
  *
- * Fetches open-access PDFs for every source that still needs one and streams
+ * Fetches PDFs for every source that still needs one and streams
  * per-source progress as SSE. An optional `{ sourceIds: string[] }` body
  * restricts the run to a single import batch.
  *

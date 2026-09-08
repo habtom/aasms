@@ -151,7 +151,7 @@ LLM_PROVIDER="claude"
 # Required for Unpaywall lookups when fetching open-access PDFs
 OA_CONTACT_EMAIL="you@example.org"
 # Optional publisher keys. Each one adds a database to the PDF search
-ELSEVIER_API_KEY=""   # Scopus + ScienceDirect, from https://dev.elsevier.com
+ELSEVIER_API_KEY=""   # Scopus lookup + Elsevier PDFs, from https://dev.elsevier.com
 ELSEVIER_INST_TOKEN="" # Institutional token from your library (paywalled Elsevier articles)
 IEEE_API_KEY=""       # IEEE Xplore, from https://developer.ieee.org
 ACM_DL_COOKIE=""      # Cookie header of a signed-in dl.acm.org session
@@ -202,7 +202,7 @@ Python service runs on **http://localhost:8000**
 | `PDF_RETRIEVAL_TIMEOUT_SECONDS` | Timeout per open-access API call and PDF download | `30` |
 | `PDF_RETRIEVAL_MAX_MB` | Largest PDF that will be downloaded | `50` |
 | `SEMANTIC_SCHOLAR_API_KEY` | Optional key from https://www.semanticscholar.org/product/api. Without it, Semantic Scholar throttles batch lookups with HTTP 429 | - |
-| `ELSEVIER_API_KEY` | Elsevier developer key (`SCOPUS_API_KEY` works too). Scopus title-to-DOI lookup and ScienceDirect PDFs; see [Publisher API keys](#publisher-api-keys-for-pdf-retrieval) | - |
+| `ELSEVIER_API_KEY` | Elsevier developer key (`SCOPUS_API_KEY` works too). Scopus title-to-DOI lookup and Elsevier PDFs; see [Publisher API keys](#publisher-api-keys-for-pdf-retrieval) | - |
 | `ELSEVIER_INST_TOKEN` | Institutional token from your library, for paywalled Elsevier articles | - |
 | `IEEE_API_KEY` | IEEE Xplore developer key; the free tier allows 200 calls a day | - |
 | `ACM_DL_COOKIE` | `Cookie` header of a signed-in dl.acm.org session; capture steps below | - |
@@ -214,7 +214,7 @@ Python service runs on **http://localhost:8000**
 
 | Key | Where to get it | What it gives you | Limits |
 |-----|-----------------|-------------------|--------|
-| `ELSEVIER_API_KEY` | Free at https://dev.elsevier.com under "My API Key". | Full text for articles Elsevier flags as open access (Heliyon, OA-marked IFAC or Procedia papers). Without the key these fail because ScienceDirect blocks direct downloads. Also the Scopus title-to-DOI lookup for records without a DOI. | Paywalled articles: the API returns a first-page preview, even from the university network or VPN. |
+| `ELSEVIER_API_KEY` | Free at https://dev.elsevier.com under "My API Key". | Full text for articles Elsevier flags as open access (Heliyon, OA-marked IFAC or Procedia papers). Without the key these fail because Elsevier blocks direct downloads. Also the Scopus title-to-DOI lookup for records without a DOI. | Paywalled articles: the API returns a first-page preview, even from the university network or VPN. |
 | `ELSEVIER_INST_TOKEN` | From your library; Elsevier issues it per institution. | Paywalled articles through the same API, from any network. | Cannot be self-generated. |
 | `IEEE_API_KEY` | Free at https://developer.ieee.org; 200 calls a day, so the resolver only runs for IEEE DOIs. | Metadata by DOI or title, and the PDF of open-access papers (IEEE Access, CC BY). | Locked papers, which are reported with an Xplore link for manual upload. |
 | `ACM_DL_COOKIE` + `ACM_DL_USER_AGENT` | See below. | Subscriber access to dl.acm.org through your institutional login. | Expires with the browser session; capture it again then. |

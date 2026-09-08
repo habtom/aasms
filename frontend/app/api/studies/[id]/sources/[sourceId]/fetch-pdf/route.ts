@@ -5,7 +5,7 @@ import { fetchAndStoreOpenAccessPdf } from "@/lib/api-utils/pdf-retrieval";
 /**
  * POST /api/studies/[id]/sources/[sourceId]/fetch-pdf
  *
- * Retries the open-access PDF lookup for a single source.
+ * Retries the PDF lookup for a single source.
  */
 export async function POST(
   _request: NextRequest,
