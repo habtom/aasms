@@ -124,8 +124,8 @@ class ExportService:
         """Fetch all sources for a study."""
         query = text("""
             SELECT
-                s.id, s.title, s.authors, s.year, s."publicationDate", s.venue,
-                s."venueType", s.doi, s.url, s."sourceCategory", s."greyLiteratureTier",
+                s.id, s.title, s.authors, s."publicationDate", s.venue,
+                s."venueType", s.doi, s."originalUrl" AS url, s."sourceCategory", s."greyLiteratureTier",
                 s.status, s."finalDecision", sa."inclusionRecommendation",
                 sa."confidenceScore", sa."exclusionReasoning", sa."inclusionReasoning"
             FROM "Source" s
@@ -140,29 +140,35 @@ class ExportService:
         """Fetch included sources with their classifications."""
         query = text("""
             SELECT
-                s.id, s.title, s.authors, s.year, s."publicationDate", s.venue, s.doi,
-                COALESCE(json_object_agg(
-                    f.id, json_build_object(
-                        'facetName', f.name,
-                        'facetType', f.type,
-                        'classifications', COALESCE(json_agg(
+                s.id, s.title, s.authors, s."publicationDate", s.venue, s.doi,
+                COALESCE((
+                    SELECT json_object_agg(facet_data."facetId", facet_data.data)
+                    FROM (
+                        -- Aggregate each facet separately before building the source object.
+                        SELECT f.id AS "facetId",
                             json_build_object(
-                                'categoryId', c."categoryId",
-                                'categoryName', fc.name,
-                                'value', c.value,
-                                'confidence', c.confidence
-                            )
-                        ) FILTER (WHERE c.id IS NOT NULL), '[]'::json)
-                    )
-                ), '{}'::json) as classifications
+                                'facetName', f.name,
+                                'facetType', f.type,
+                                'classifications', json_agg(
+                                    json_build_object(
+                                        'categoryId', c."categoryId",
+                                        'categoryName', fc.name,
+                                        'value', c.value,
+                                        'confidence', c.confidence
+                                    ) ORDER BY c."createdAt", c.id
+                                )
+                            ) AS data
+                        FROM "Classification" c
+                        JOIN "Facet" f ON c."facetId" = f.id
+                        LEFT JOIN "FacetCategory" fc ON c."categoryId" = fc.id
+                        WHERE c."analysisId" = sa.id
+                        GROUP BY f.id, f.name, f.type
+                    ) facet_data
+                ), '{}'::json) AS classifications
             FROM "Source" s
             LEFT JOIN "SourceAnalysis" sa ON s.id = sa."sourceId"
-            LEFT JOIN "Classification" c ON sa.id = c."analysisId"
-            LEFT JOIN "Facet" f ON c."facetId" = f.id
-            LEFT JOIN "FacetCategory" fc ON c."categoryId" = fc.id
             WHERE s."studyId" = :study_id
             AND (s."finalDecision" = 'INCLUDE' OR s.status = 'CLASSIFIED')
-            GROUP BY s.id, s.title, s.authors, s.year, s."publicationDate", s.venue, s.doi
             ORDER BY s.title
         """)
         results = self.db.execute(query, {"study_id": study_id}).fetchall()
@@ -172,7 +178,7 @@ class ExportService:
         """Fetch excluded sources."""
         query = text("""
             SELECT
-                s.title, s.authors, s.year, s."publicationDate",
+                s.title, s.authors, s."publicationDate",
                 sa."exclusionReasoning", sa."inclusionReasoning",
                 sa."confidenceScore"
             FROM "Source" s
