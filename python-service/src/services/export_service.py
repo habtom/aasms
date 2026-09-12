@@ -3,6 +3,7 @@
 import logging
 from datetime import datetime
 from io import BytesIO
+from textwrap import wrap
 from typing import Any
 
 from openpyxl import Workbook
@@ -64,34 +65,36 @@ class ExportService:
         query = text("""
             SELECT
                 s.id, s.title, s.description, s.motivation, s.status, s."createdAt",
-                COALESCE(json_agg(
-                    json_build_object(
+                COALESCE((
+                    SELECT json_agg(json_build_object(
                         'id', rq.id,
                         'question', rq.question,
-                        'order', rq.order
-                    ) ORDER BY rq."order"
-                ) FILTER (WHERE rq.id IS NOT NULL), '[]'::json) as "researchQuestions",
-                COALESCE(json_agg(
-                    json_build_object(
+                        'order', rq."order"
+                    ) ORDER BY rq."order", rq.id)
+                    FROM "ResearchQuestion" rq
+                    WHERE rq."studyId" = s.id
+                ), '[]'::json) AS "researchQuestions",
+                COALESCE((
+                    SELECT json_agg(json_build_object(
                         'id', ic.id,
                         'criterion', ic.criterion,
                         'order', ic."order"
-                    ) ORDER BY ic."order"
-                ) FILTER (WHERE ic.id IS NOT NULL), '[]'::json) as "inclusionCriteria",
-                COALESCE(json_agg(
-                    json_build_object(
+                    ) ORDER BY ic."order", ic.id)
+                    FROM "InclusionCriterion" ic
+                    WHERE ic."parametersId" = sp.id
+                ), '[]'::json) AS "inclusionCriteria",
+                COALESCE((
+                    SELECT json_agg(json_build_object(
                         'id', ec.id,
                         'criterion', ec.criterion,
                         'order', ec."order"
-                    ) ORDER BY ec."order"
-                ) FILTER (WHERE ec.id IS NOT NULL), '[]'::json) as "exclusionCriteria"
+                    ) ORDER BY ec."order", ec.id)
+                    FROM "ExclusionCriterion" ec
+                    WHERE ec."parametersId" = sp.id
+                ), '[]'::json) AS "exclusionCriteria"
             FROM "Study" s
-            LEFT JOIN "ResearchQuestion" rq ON s.id = rq."studyId"
             LEFT JOIN "StudyParameters" sp ON s.id = sp."studyId"
-            LEFT JOIN "InclusionCriterion" ic ON sp.id = ic."parametersId"
-            LEFT JOIN "ExclusionCriterion" ec ON sp.id = ec."parametersId"
             WHERE s.id = :study_id
-            GROUP BY s.id, s.title, s.description, s.motivation, s.status, s."createdAt"
         """)
         result = self.db.execute(query, {"study_id": study_id}).fetchone()
         if not result:
@@ -99,23 +102,31 @@ class ExportService:
         return dict(result._mapping)
 
     def _fetch_facets(self, study_id: str) -> list[dict[str, Any]]:
-        """Fetch facets with categories for a study."""
+        """Fetch facet configuration, categories, and RQ links independently."""
         query = text("""
             SELECT
-                f.id, f.name, f.description, f.type, f."order",
-                COALESCE(json_agg(
-                    json_build_object(
+                f.id, f.name, f.description, f.type, f."order", f.required,
+                f."metadataField", f."metadataTransform",
+                f."codingEnabled", f."autoAssignThreshold",
+                COALESCE((
+                    SELECT json_agg(json_build_object(
                         'id', fc.id,
                         'name', fc.name,
                         'description', fc.description,
                         'order', fc."order"
-                    ) ORDER BY fc."order"
-                ) FILTER (WHERE fc.id IS NOT NULL), '[]'::json) as categories
+                    ) ORDER BY fc."order", fc.id)
+                    FROM "FacetCategory" fc
+                    WHERE fc."facetId" = f.id
+                ), '[]'::json) AS categories,
+                COALESCE((
+                    SELECT json_agg(rq.id ORDER BY rq."order", rq.id)
+                    FROM "FacetResearchQuestion" frq
+                    JOIN "ResearchQuestion" rq ON rq.id = frq."researchQuestionId"
+                    WHERE frq."facetId" = f.id AND rq."studyId" = f."studyId"
+                ), '[]'::json) AS "researchQuestionIds"
             FROM "Facet" f
-            LEFT JOIN "FacetCategory" fc ON f.id = fc."facetId"
             WHERE f."studyId" = :study_id
-            GROUP BY f.id, f.name, f.description, f.type, f."order"
-            ORDER BY f."order", f.name
+            ORDER BY f."order", f.name, f.id
         """)
         results = self.db.execute(query, {"study_id": study_id}).fetchall()
         return [dict(r._mapping) for r in results]
@@ -195,8 +206,8 @@ class ExportService:
         ws = wb.create_sheet("Protocol", 0)
 
         # Set column widths
-        ws.column_dimensions["A"].width = 30
-        ws.column_dimensions["B"].width = 70
+        ws.column_dimensions["A"].width = 40
+        ws.column_dimensions["B"].width = 110
 
         row = 1
 
@@ -222,7 +233,7 @@ class ExportService:
 
         rqs = study.get("researchQuestions", [])
         for idx, rq in enumerate(rqs, 1):
-            ws.cell(row, 1, f"{idx}.")
+            ws.cell(row, 1, f"RQ{idx}")
             ws.cell(row, 2, rq.get("question", ""))
             row += 1
 
@@ -238,7 +249,7 @@ class ExportService:
 
         inc_criteria = study.get("inclusionCriteria", [])
         for idx, ic in enumerate(inc_criteria, 1):
-            ws.cell(row, 1, f"{idx}.")
+            ws.cell(row, 1, f"IC{idx}")
             ws.cell(row, 2, ic.get("criterion", ""))
             row += 1
 
@@ -254,7 +265,7 @@ class ExportService:
 
         exc_criteria = study.get("exclusionCriteria", [])
         for idx, ec in enumerate(exc_criteria, 1):
-            ws.cell(row, 1, f"{idx}.")
+            ws.cell(row, 1, f"EC{idx}")
             ws.cell(row, 2, ec.get("criterion", ""))
             row += 1
 
@@ -269,29 +280,65 @@ class ExportService:
         row += 1
 
         facets = self._fetch_facets(study["id"])
+        rq_labels = {rq["id"]: f"RQ{idx}" for idx, rq in enumerate(rqs, 1)}
+        facet_type_labels = {
+            "CLOSED": "Category (CLOSED)",
+            "OPEN": "Open (OPEN)",
+            "OPEN_CODED": "Coded (from Open) (OPEN_CODED)",
+        }
 
-        for facet in facets:
-            ws.cell(row, 1, f"Facet: {facet.get('name', '')}").font = Font(bold=True)
+        for idx, facet in enumerate(facets, 1):
+            self._add_row(ws, row, f"Facet F{idx}", facet.get("name", ""))
             row += 1
 
-            ws.cell(row, 1, "Type")
-            ws.cell(row, 2, facet.get("type", ""))
+            self._add_row(ws, row, "Description", facet.get("description") or "", bold=False)
             row += 1
 
-            if facet.get("description"):
-                ws.cell(row, 1, "Description")
-                ws.cell(row, 2, facet.get("description", ""))
+            linked_rqs = [
+                rq_labels[rq_id]
+                for rq_id in facet.get("researchQuestionIds", [])
+                if rq_id in rq_labels
+            ]
+            configuration = [
+                ("Linked Research Questions", ", ".join(linked_rqs) or "None"),
+                ("Type", facet_type_labels.get(facet.get("type"), facet.get("type", ""))),
+                ("Required Field", "Yes" if facet.get("required") else "No"),
+                ("Metadata Field", facet.get("metadataField") or "None (use LLM)"),
+                ("Metadata Transform", facet.get("metadataTransform") or "None"),
+                ("Coding Enabled", "Yes" if facet.get("codingEnabled") else "No"),
+            ]
+            for label, value in configuration:
+                self._add_row(ws, row, label, value, bold=False)
+                row += 1
+
+            if facet.get("codingEnabled") or facet.get("type") == "OPEN_CODED":
+                threshold = facet.get("autoAssignThreshold")
+                self._add_row(
+                    ws,
+                    row,
+                    "Auto-assign Threshold",
+                    threshold if threshold is not None else "Not configured",
+                    bold=False,
+                )
+                if threshold is not None:
+                    ws.cell(row, 2).number_format = "0%"
                 row += 1
 
             categories = facet.get("categories", [])
-            if categories and facet.get("type") in ["CLOSED", "OPEN_CODED"]:
-                ws.cell(row, 1, "Categories").font = Font(italic=True)
+            ws.cell(row, 1, f"Categories ({len(categories)})").font = Font(italic=True)
+            if not categories:
+                ws.cell(
+                    row,
+                    2,
+                    "No predefined categories (open text)"
+                    if facet.get("type") == "OPEN"
+                    else "No categories defined",
+                )
+            row += 1
+            for cat in categories:
+                ws.cell(row, 1, f"  - {cat.get('name', '')}")
+                ws.cell(row, 2, cat.get("description") or "")
                 row += 1
-                for cat in categories:
-                    ws.cell(row, 1, f"  - {cat.get('name', '')}")
-                    if cat.get("description"):
-                        ws.cell(row, 2, cat.get("description", ""))
-                    row += 1
 
             row += 1
 
@@ -299,6 +346,20 @@ class ExportService:
         row += 1
         ws.cell(row, 1, "Date Generated")
         ws.cell(row, 2, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+        # Excel does not auto-fit row heights on files written by openpyxl.
+        # Account for explicit newlines and wrapping so full definitions are visible.
+        for cells in ws.iter_rows():
+            line_count = 1
+            for cell in cells:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                width = int(ws.column_dimensions[cell.column_letter].width * 0.9)
+                lines = sum(
+                    max(1, len(wrap(line, width=width)))
+                    for line in str(cell.value or "").split("\n")
+                )
+                line_count = max(line_count, lines)
+            ws.row_dimensions[cells[0].row].height = min(409, line_count * 15 + 6)
 
     def _create_all_sources_sheet(self, wb: Workbook, study: dict[str, Any]) -> None:
         """Create All Sources sheet with all sources."""
@@ -551,7 +612,7 @@ class ExportService:
 
         ws.freeze_panes = "A2"
 
-    def _add_row(self, ws, row: int, label: str, value: str, bold: bool = False) -> None:
+    def _add_row(self, ws, row: int, label: str, value: str | float, bold: bool = True) -> None:
         """Add a label-value row."""
         cell_label = ws.cell(row, 1, label)
         if bold:
@@ -560,6 +621,3 @@ class ExportService:
         cell_value = ws.cell(row, 2, value)
         if bold:
             cell_value.font = Font(bold=True)
-
-        ws.column_dimensions["A"].width = 30
-        ws.column_dimensions["B"].width = 70
