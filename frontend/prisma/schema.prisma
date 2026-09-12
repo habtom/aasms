@@ -18,6 +18,8 @@ model Study {
   updatedAt               DateTime                 @updatedAt
   motivation              String?
   importStatistics        Json?
+  rqSummaries             Json?
+  rqSummariesGeneratedAt  DateTime?
   researchQuestions       ResearchQuestion[]
   sources                 Source[]
   parameters              StudyParameters?

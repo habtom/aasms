@@ -296,6 +296,29 @@ export interface ExportRequest {
   filters?: Filter[];
 }
 
+// ============ RQ Summary Types ============
+
+// A type alias, not an interface, so it can be written to a Prisma Json column
+export type RQSummaryItem = {
+  rq_id: string;
+  question: string;
+  summary: string;
+  key_findings: string[];
+  evidence_quality: "strong" | "moderate" | "limited";
+  gaps: string[];
+  /** Set by the python service when generating this answer failed */
+  failed?: boolean;
+};
+
+export interface RQSummaryData {
+  summaries: RQSummaryItem[];
+  generatedAt: string | null;
+  /** Research questions were added, removed, reworded or reordered since generating */
+  questionsChanged: boolean;
+  /** The summaries were generated but could not be saved */
+  saveFailed?: boolean;
+}
+
 // ============ Multi-LLM Voting Types ============
 
 export interface VoteDetail {

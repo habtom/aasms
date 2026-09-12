@@ -2,6 +2,53 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { PYTHON_SERVICE_URL } from "@/lib/python-service";
 import { Decision, SourceStatus } from "@prisma/client";
+import type { RQSummaryData, RQSummaryItem } from "@/types/analysis";
+
+const GENERATION_FAILED = "Generating summaries failed. Nothing was changed.";
+
+// True if research questions were added, removed, reworded or reordered since generating
+function questionsChanged(summaries: RQSummaryItem[], questions: { question: string }[]) {
+  return (
+    summaries.length !== questions.length ||
+    summaries.some((s, i) => s.question.trim() !== questions[i].question.trim())
+  );
+}
+
+// Returns the last saved summaries exactly as generated, or null if none were saved.
+export async function GET(_request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const { id: studyId } = await params;
+
+    const study = await prisma.study.findUnique({
+      where: { id: studyId },
+      select: {
+        rqSummaries: true,
+        rqSummariesGeneratedAt: true,
+        researchQuestions: { select: { question: true }, orderBy: { order: "asc" } },
+      },
+    });
+
+    if (!study) {
+      return NextResponse.json({ error: "Study not found" }, { status: 404 });
+    }
+
+    const summaries = (study.rqSummaries as { summaries?: RQSummaryItem[] } | null)?.summaries;
+
+    if (!summaries?.length) {
+      return NextResponse.json({ data: null });
+    }
+
+    const data: RQSummaryData = {
+      summaries,
+      generatedAt: study.rqSummariesGeneratedAt?.toISOString() ?? null,
+      questionsChanged: questionsChanged(summaries, study.researchQuestions),
+    };
+    return NextResponse.json({ data });
+  } catch (error) {
+    console.error("Error fetching RQ summaries:", error);
+    return NextResponse.json({ error: "Failed to fetch RQ summaries" }, { status: 500 });
+  }
+}
 
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -27,9 +74,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     }
 
     if (study.researchQuestions.length === 0) {
-      return NextResponse.json({
-        data: { summaries: [] },
-      });
+      return NextResponse.json(
+        { error: "Add research questions before generating summaries." },
+        { status: 400 },
+      );
     }
 
     // Build facet data with classification counts
@@ -150,16 +198,47 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     if (!pythonRes.ok) {
       const errorText = await pythonRes.text();
       console.error("Python service rq-summaries error:", errorText);
-      return NextResponse.json(
-        { error: "Failed to generate RQ summaries" },
-        { status: pythonRes.status },
-      );
+      return NextResponse.json({ error: GENERATION_FAILED }, { status: pythonRes.status });
     }
 
-    const result = await pythonRes.json();
-    return NextResponse.json({ data: result });
+    const result: { summaries?: RQSummaryItem[] } = await pythonRes.json();
+    const summaries = result.summaries ?? [];
+    const failedCount = summaries.filter((s) => s.failed).length;
+
+    // Only complete runs are saved, so a failure never replaces a saved summary
+    if (failedCount > 0 || summaries.length !== study.researchQuestions.length) {
+      console.error(
+        `rq-summaries: ${failedCount} failed, ${summaries.length} returned for ${study.researchQuestions.length} RQs`,
+      );
+      const error =
+        failedCount > 0
+          ? `Generating failed for ${failedCount} of ${summaries.length} research questions. Nothing was changed.`
+          : GENERATION_FAILED;
+      return NextResponse.json({ error }, { status: 502 });
+    }
+
+    const now = new Date();
+    let saveFailed = false;
+    try {
+      await prisma.study.update({
+        where: { id: studyId },
+        data: { rqSummaries: { summaries }, rqSummariesGeneratedAt: now },
+      });
+    } catch (error) {
+      // Still show the summaries; the LLM calls already ran
+      console.error("Error saving RQ summaries:", error);
+      saveFailed = true;
+    }
+
+    const data: RQSummaryData = {
+      summaries,
+      generatedAt: now.toISOString(),
+      questionsChanged: false,
+      saveFailed,
+    };
+    return NextResponse.json({ data });
   } catch (error) {
     console.error("Error generating RQ summaries:", error);
-    return NextResponse.json({ error: "Failed to generate RQ summaries" }, { status: 500 });
+    return NextResponse.json({ error: GENERATION_FAILED }, { status: 500 });
   }
 }

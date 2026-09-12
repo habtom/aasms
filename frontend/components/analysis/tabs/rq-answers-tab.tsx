@@ -5,24 +5,16 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Sparkles, RefreshCw, AlertCircle, CheckCircle2, MinusCircle } from "lucide-react";
-
-export interface RQSummaryItem {
-  rq_id: string;
-  question: string;
-  summary: string;
-  key_findings: string[];
-  evidence_quality: "strong" | "moderate" | "limited";
-  gaps: string[];
-}
-
-export interface RQSummaryData {
-  summaries: RQSummaryItem[];
-}
+import type { RQSummaryData } from "@/types/analysis";
 
 interface RqAnswersTabProps {
   studyId: string;
   data: RQSummaryData | undefined;
+  isLoading: boolean;
+  loadError: boolean;
+  onRetryLoad: () => void;
   isGenerating: boolean;
+  generateError: string | null;
   onGenerate: () => void;
   hasClassifiedSources: boolean;
 }
@@ -48,14 +40,75 @@ const QUALITY_CONFIG = {
   },
 };
 
+function SkeletonCards() {
+  return (
+    <>
+      {[1, 2].map((i) => (
+        <Card key={i}>
+          <CardHeader>
+            <Skeleton className="h-5 w-3/4" />
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <Skeleton className="h-4 w-full" />
+            <Skeleton className="h-4 w-full" />
+            <Skeleton className="h-4 w-2/3" />
+          </CardContent>
+        </Card>
+      ))}
+    </>
+  );
+}
+
 export function RqAnswersTab({
   studyId,
   data,
+  isLoading,
+  loadError,
+  onRetryLoad,
   isGenerating,
+  generateError,
   onGenerate,
   hasClassifiedSources,
 }: RqAnswersTabProps) {
-  if (!hasClassifiedSources) {
+  if (isGenerating) {
+    return (
+      <div className="space-y-4">
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Sparkles className="h-4 w-4 animate-pulse" />
+          Generating summaries with AI...
+        </div>
+        <SkeletonCards />
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="space-y-4">
+        <SkeletonCards />
+      </div>
+    );
+  }
+
+  if (!data && loadError) {
+    return (
+      <Card>
+        <CardContent className="py-12 text-center">
+          <AlertCircle className="h-10 w-10 text-muted-foreground mx-auto mb-4" />
+          <h3 className="text-lg font-medium mb-2">Could not load saved summaries</h3>
+          <p className="text-sm text-muted-foreground max-w-md mx-auto mb-6">
+            Retry to see your saved summaries.
+          </p>
+          <Button variant="outline" onClick={onRetryLoad}>
+            <RefreshCw className="h-4 w-4 mr-2" />
+            Retry
+          </Button>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (!data && !hasClassifiedSources) {
     return (
       <Card>
         <CardContent className="py-12 text-center">
@@ -70,29 +123,6 @@ export function RqAnswersTab({
     );
   }
 
-  if (isGenerating) {
-    return (
-      <div className="space-y-4">
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Sparkles className="h-4 w-4 animate-pulse" />
-          Generating summaries with AI...
-        </div>
-        {[1, 2].map((i) => (
-          <Card key={i}>
-            <CardHeader>
-              <Skeleton className="h-5 w-3/4" />
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <Skeleton className="h-4 w-full" />
-              <Skeleton className="h-4 w-full" />
-              <Skeleton className="h-4 w-2/3" />
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-    );
-  }
-
   if (!data) {
     return (
       <Card>
@@ -103,10 +133,11 @@ export function RqAnswersTab({
             Use AI to synthesize answers to your research questions based on the classification data
             and source evidence from your study.
           </p>
-          <Button onClick={onGenerate} disabled={isGenerating}>
+          <Button onClick={onGenerate}>
             <Sparkles className="h-4 w-4 mr-2" />
             Generate Summaries
           </Button>
+          {generateError && <p className="text-sm text-red-600 mt-4">{generateError}</p>}
         </CardContent>
       </Card>
     );
@@ -118,12 +149,26 @@ export function RqAnswersTab({
         <p className="text-sm text-muted-foreground">
           {data.summaries.length} research question{data.summaries.length !== 1 ? "s" : ""}{" "}
           summarized
+          {data.generatedAt && ` · generated ${new Date(data.generatedAt).toLocaleString()}`}
         </p>
-        <Button variant="outline" size="sm" onClick={onGenerate} disabled={isGenerating}>
+        <Button variant="outline" size="sm" onClick={onGenerate} disabled={!hasClassifiedSources}>
           <RefreshCw className="h-4 w-4 mr-2" />
           Regenerate All
         </Button>
       </div>
+
+      {data.questionsChanged && (
+        <p className="text-sm text-amber-700">
+          Your research questions changed since these summaries were generated. Regenerate All to
+          update them.
+        </p>
+      )}
+      {data.saveFailed && (
+        <p className="text-sm text-amber-700">
+          These summaries could not be saved and may disappear when you reload or leave this page.
+        </p>
+      )}
+      {generateError && <p className="text-sm text-red-600">{generateError}</p>}
 
       {data.summaries.map((item, index) => {
         const qualityConfig = QUALITY_CONFIG[item.evidence_quality] || QUALITY_CONFIG.limited;

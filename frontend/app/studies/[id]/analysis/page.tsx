@@ -258,7 +258,11 @@ export default function AnalysisPage() {
             <RqAnswersTab
               studyId={studyId}
               data={analysis.rqSummaries.data}
+              isLoading={analysis.rqSummaries.isLoading}
+              loadError={analysis.rqSummaries.loadError}
+              onRetryLoad={analysis.rqSummaries.retryLoad}
               isGenerating={analysis.rqSummaries.isGenerating}
+              generateError={analysis.rqSummaries.generateError}
               onGenerate={analysis.rqSummaries.generate}
               hasClassifiedSources={analysis.rqSummaries.hasClassifiedSources}
             />

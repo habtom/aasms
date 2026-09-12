@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useMemo, useCallback, useEffect } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   useSummaryStats,
   useFrequencyData,
@@ -20,6 +20,7 @@ import type {
   GapAnalysis,
   MappingTableResult,
   SummaryStats,
+  RQSummaryData,
 } from "@/types/analysis";
 
 // ============ Types ============
@@ -98,27 +99,22 @@ async function fetchFacets(studyId: string): Promise<Facet[]> {
   return data.data;
 }
 
-// ============ RQ Summary Types ============
+// ============ RQ Summaries ============
 
-export interface RQSummaryItem {
-  rq_id: string;
-  question: string;
-  summary: string;
-  key_findings: string[];
-  evidence_quality: "strong" | "moderate" | "limited";
-  gaps: string[];
-}
-
-export interface RQSummaryData {
-  summaries: RQSummaryItem[];
+async function fetchRQSummaries(studyId: string): Promise<RQSummaryData | null> {
+  const response = await fetch(`/api/studies/${studyId}/rq-summaries`);
+  if (!response.ok) throw new Error("Failed to fetch RQ summaries");
+  const data = await response.json();
+  return data.data;
 }
 
 async function generateRQSummaries(studyId: string): Promise<RQSummaryData> {
   const response = await fetch(`/api/studies/${studyId}/rq-summaries`, {
     method: "POST",
   });
-  if (!response.ok) throw new Error("Failed to generate RQ summaries");
-  const data = await response.json();
+  const data = await response.json().catch(() => ({}));
+  // The route's error says why, e.g. how many research questions failed
+  if (!response.ok) throw new Error(data.error ?? "Generating summaries failed.");
   return data.data;
 }
 
@@ -349,6 +345,11 @@ export function useAnalysisPage({ studyId }: UseAnalysisPageOptions) {
     page: mappingPage,
     pageSize: mappingPageSize,
   });
+  const rqSummariesKey = ["rq-summaries", studyId];
+  const rqSummaryQuery = useQuery({
+    queryKey: rqSummariesKey,
+    queryFn: () => fetchRQSummaries(studyId),
+  });
 
   const exportMutation = useExportData(studyId);
 
@@ -366,6 +367,7 @@ export function useAnalysisPage({ studyId }: UseAnalysisPageOptions) {
     }
     gapQuery.refetch();
     mappingTableQuery.refetch();
+    rqSummaryQuery.refetch();
   }, [
     summaryQuery,
     frequencyQuery,
@@ -374,6 +376,7 @@ export function useAnalysisPage({ studyId }: UseAnalysisPageOptions) {
     crossTabQuery,
     gapQuery,
     mappingTableQuery,
+    rqSummaryQuery,
     rowDimension,
     colDimension,
     trendsDimension,
@@ -412,12 +415,15 @@ export function useAnalysisPage({ studyId }: UseAnalysisPageOptions) {
 
   // ============ RQ Summaries State ============
 
-  const [rqSummaryData, setRqSummaryData] = useState<RQSummaryData | undefined>(undefined);
+  const queryClient = useQueryClient();
 
   const rqSummaryMutation = useMutation({
     mutationFn: () => generateRQSummaries(studyId),
     onSuccess: (data) => {
-      setRqSummaryData(data);
+      queryClient.setQueryData(rqSummariesKey, data);
+      // Show the result now, but reload from the server on the next visit: questions may
+      // have been edited meanwhile, or the save may have failed
+      queryClient.invalidateQueries({ queryKey: rqSummariesKey, refetchType: "none" });
     },
   });
 
@@ -543,8 +549,19 @@ export function useAnalysisPage({ studyId }: UseAnalysisPageOptions) {
 
     // RQ Summaries
     rqSummaries: {
-      data: rqSummaryData,
+      data: rqSummaryQuery.data ?? undefined,
+      // Covers Retry/Refresh when nothing is shown yet (data undefined or null), and waits
+      // for the stats so "No classified sources yet" never flashes
+      isLoading:
+        rqSummaryQuery.isPending ||
+        (rqSummaryQuery.isFetching && !rqSummaryQuery.data) ||
+        summaryQuery.isLoading,
+      loadError: rqSummaryQuery.isError,
+      retryLoad: () => {
+        rqSummaryQuery.refetch();
+      },
       isGenerating: rqSummaryMutation.isPending,
+      generateError: rqSummaryMutation.error?.message ?? null,
       generate: generateSummaries,
       hasClassifiedSources: (summaryQuery.data?.classifiedSources ?? 0) > 0,
     },
